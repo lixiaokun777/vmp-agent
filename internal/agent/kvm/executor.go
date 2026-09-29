@@ -73,6 +73,11 @@ type deleteTaskPayload struct {
 	Name       string `json:"name"`
 }
 
+type powerTaskPayload struct {
+	InstanceID string `json:"instance_id"`
+	Name       string `json:"name"`
+}
+
 type instanceManifest struct {
 	Version    int    `json:"version"`
 	InstanceID string `json:"instance_id"`
@@ -235,6 +240,92 @@ func (d *Driver) executeDelete(ctx context.Context, task agentmodel.Task) (agent
 		return agentmodel.TaskResult{}, err
 	}
 	return agentmodel.TaskResult{Success: true, ProviderRef: payload.InstanceID}, nil
+}
+
+func (d *Driver) executePowerAction(ctx context.Context, task agentmodel.Task) (agentmodel.TaskResult, error) {
+	var payload powerTaskPayload
+	if err := decodeTaskPayload(task.Payload, &payload); err != nil {
+		return agentmodel.TaskResult{}, err
+	}
+	if !instanceIDPattern.MatchString(payload.InstanceID) || !namePattern.MatchString(payload.Name) {
+		return agentmodel.TaskResult{}, errors.New("invalid power task identity")
+	}
+	instanceDir := filepath.Join(d.config.StorageRoot, payload.InstanceID)
+	if _, err := d.validateInstanceDirectory(payload.InstanceID, payload.Name, instanceDir, false); err != nil {
+		return agentmodel.TaskResult{}, err
+	}
+	domain, err := d.findDomain(ctx, payload.Name)
+	if err != nil {
+		return agentmodel.TaskResult{}, err
+	}
+	if domain == nil {
+		return agentmodel.TaskResult{}, errors.New("managed domain does not exist")
+	}
+	if err := verifyManagedDomain(*domain, payload.InstanceID, payload.Name); err != nil {
+		return agentmodel.TaskResult{}, err
+	}
+	stateOutput, err := d.virsh(ctx, "domstate", payload.Name)
+	if err != nil {
+		return agentmodel.TaskResult{}, err
+	}
+	state := normalizeState(string(stateOutput))
+	switch task.Type {
+	case "START_INSTANCE":
+		if state == "RUNNING" {
+			return agentmodel.TaskResult{Success: true, ProviderRef: payload.InstanceID}, nil
+		}
+		if state != "SHUT_OFF" && state != "SHUTOFF" {
+			return agentmodel.TaskResult{}, fmt.Errorf("domain cannot be started from state %q", state)
+		}
+		if _, err := d.virshWrite(ctx, "start", payload.Name); err != nil {
+			return agentmodel.TaskResult{}, err
+		}
+	case "STOP_INSTANCE":
+		if state == "SHUT_OFF" || state == "SHUTOFF" {
+			return agentmodel.TaskResult{Success: true, ProviderRef: payload.InstanceID}, nil
+		}
+		if state != "RUNNING" {
+			return agentmodel.TaskResult{}, fmt.Errorf("domain cannot be stopped from state %q", state)
+		}
+		if _, err := d.virshWrite(ctx, "shutdown", payload.Name); err != nil {
+			return agentmodel.TaskResult{}, err
+		}
+		if err := d.waitForDomainState(ctx, payload.Name, 45*time.Second, "SHUT_OFF", "SHUTOFF"); err != nil {
+			return agentmodel.TaskResult{}, err
+		}
+	case "REBOOT_INSTANCE":
+		if state != "RUNNING" {
+			return agentmodel.TaskResult{}, fmt.Errorf("domain cannot be rebooted from state %q", state)
+		}
+		if _, err := d.virshWrite(ctx, "reboot", payload.Name); err != nil {
+			return agentmodel.TaskResult{}, err
+		}
+	default:
+		return agentmodel.TaskResult{}, fmt.Errorf("unsupported power task type %q", task.Type)
+	}
+	return agentmodel.TaskResult{Success: true, ProviderRef: payload.InstanceID}, nil
+}
+
+func (d *Driver) waitForDomainState(ctx context.Context, name string, timeout time.Duration, accepted ...string) error {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		output, err := d.virsh(waitCtx, "domstate", name)
+		if err != nil {
+			return err
+		}
+		state := normalizeState(string(output))
+		for _, target := range accepted {
+			if state == target {
+				return nil
+			}
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("timeout waiting for domain state: %w", waitCtx.Err())
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 func decodeTaskPayload(payload map[string]any, out any) error {

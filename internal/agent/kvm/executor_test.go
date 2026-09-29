@@ -54,6 +54,12 @@ func (r *executorRunner) Run(_ context.Context, name string, args ...string) ([]
 	case strings.Contains(command, " destroy "):
 		r.domainRunning = false
 		return []byte("destroyed\n"), nil
+	case strings.Contains(command, " shutdown "):
+		r.domainRunning = false
+		return []byte("shut down\n"), nil
+	case strings.Contains(command, " reboot "):
+		r.domainRunning = true
+		return []byte("rebooted\n"), nil
 	case strings.Contains(command, " undefine "):
 		r.domainPresent = false
 		return []byte("undefined\n"), nil
@@ -217,5 +223,49 @@ func TestReadonlyDriverRejectsCreate(t *testing.T) {
 	driver := &Driver{config: Config{WriteEnabled: false}}
 	if _, err := driver.Execute(context.Background(), createTask()); err == nil {
 		t.Fatal("expected read-only mode to reject create")
+	}
+}
+
+func TestExecutePowerActions(t *testing.T) {
+	runner := &executorRunner{}
+	driver, _ := newWritableTestDriver(t, runner)
+	created, err := driver.Execute(context.Background(), createTask())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := map[string]any{"instance_id": created.ProviderRef, "name": "lease-dev-001"}
+	for _, taskType := range []string{"REBOOT_INSTANCE", "STOP_INSTANCE", "START_INSTANCE"} {
+		result, err := driver.Execute(context.Background(), agentmodel.Task{ID: "power-" + taskType, Type: taskType, Payload: payload})
+		if err != nil {
+			t.Fatalf("%s failed: %v", taskType, err)
+		}
+		if !result.Success || result.ProviderRef != created.ProviderRef {
+			t.Fatalf("unexpected %s result: %#v", taskType, result)
+		}
+	}
+	if !runner.domainRunning {
+		t.Fatal("domain should be running after the final start")
+	}
+}
+
+func TestPowerActionRefusesExternalDomain(t *testing.T) {
+	runner := &executorRunner{domainPresent: true, domainRunning: true, domainXML: []byte(externalDomainXML)}
+	driver, storageRoot := newWritableTestDriver(t, runner)
+	instanceID := "123e4567-e89b-42d3-a456-426614174000"
+	instanceDir := filepath.Join(storageRoot, instanceID)
+	if err := os.Mkdir(instanceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(instanceDir, "manifest.json"), []byte(`{"version":1,"instance_id":"123e4567-e89b-42d3-a456-426614174000","name":"lease-dev-001"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	task := agentmodel.Task{ID: "power-external", Type: "STOP_INSTANCE", Payload: map[string]any{"instance_id": instanceID, "name": "lease-dev-001"}}
+	if _, err := driver.Execute(context.Background(), task); err == nil {
+		t.Fatal("expected external domain power action to be rejected")
+	}
+	for _, command := range runner.commands {
+		if strings.Contains(command, " shutdown ") {
+			t.Fatalf("shutdown command was issued: %s", command)
+		}
 	}
 }
