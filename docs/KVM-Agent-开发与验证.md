@@ -9,6 +9,8 @@ Agent 已形成 Provider Driver 边界，并支持两种模式：
 
 `kvm-readonly` 模式固定使用 `virsh --readonly --connect qemu:///system`，不会领取创建任务，`Execute` 方法也会明确拒绝任何写操作。
 
+当前已完成离线交付计划生成器和单元测试。计划生成器不写入文件、不调用 `qemu-img`、不生成 seed ISO，也不调用 `virsh define/start`；node3 上的 Agent 仍保持只读版本。
+
 ## 采集内容
 
 - 宿主机名、架构、内核版本；
