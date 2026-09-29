@@ -30,6 +30,7 @@ type Config struct {
 	MemoryCapMB    int
 	DiskCapGB      int
 	SafetyMemoryMB int
+	WriteEnabled   bool
 }
 
 type Runner interface {
@@ -50,6 +51,7 @@ func (CommandRunner) Run(ctx context.Context, name string, args ...string) ([]by
 type Driver struct {
 	config Config
 	runner Runner
+	files  FileSystem
 }
 
 func New(config Config, runner Runner) (*Driver, error) {
@@ -79,18 +81,36 @@ func New(config Config, runner Runner) (*Driver, error) {
 	if runner == nil {
 		runner = CommandRunner{}
 	}
-	return &Driver{config: config, runner: runner}, nil
+	return &Driver{config: config, runner: runner, files: OSFileSystem{}}, nil
 }
 
-func (d *Driver) Mode() string { return "kvm-readonly" }
+func (d *Driver) Mode() string {
+	if d.config.WriteEnabled {
+		return "kvm"
+	}
+	return "kvm-readonly"
+}
 
-func (d *Driver) Execute(context.Context, agentmodel.Task) (agentmodel.TaskResult, error) {
-	return agentmodel.TaskResult{}, errors.New("KVM write operations are disabled; agent is in read-only mode")
+func (d *Driver) Execute(ctx context.Context, task agentmodel.Task) (agentmodel.TaskResult, error) {
+	if !d.config.WriteEnabled {
+		return agentmodel.TaskResult{}, errors.New("KVM write operations are disabled; agent is in read-only mode")
+	}
+	switch task.Type {
+	case "CREATE_INSTANCE":
+		return d.executeCreate(ctx, task)
+	case "DELETE_INSTANCE":
+		return d.executeDelete(ctx, task)
+	default:
+		return agentmodel.TaskResult{}, fmt.Errorf("unsupported KVM task type %q", task.Type)
+	}
 }
 
 func (d *Driver) Inspect(ctx context.Context) (agentmodel.Snapshot, error) {
 	checks := d.preflight(ctx)
 	status := "CORDONED"
+	if d.config.WriteEnabled {
+		status = "ACTIVE"
+	}
 	for _, check := range checks {
 		if !check.OK {
 			status = "DEGRADED"
@@ -149,6 +169,11 @@ func (d *Driver) preflight(ctx context.Context) []agentmodel.Check {
 
 func (d *Driver) virsh(ctx context.Context, args ...string) ([]byte, error) {
 	base := []string{"--readonly", "--connect", d.config.LibvirtURI}
+	return d.runner.Run(ctx, d.config.VirshPath, append(base, args...)...)
+}
+
+func (d *Driver) virshWrite(ctx context.Context, args ...string) ([]byte, error) {
+	base := []string{"--connect", d.config.LibvirtURI}
 	return d.runner.Run(ctx, d.config.VirshPath, append(base, args...)...)
 }
 

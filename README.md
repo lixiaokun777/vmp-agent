@@ -9,7 +9,7 @@ VMP Agent 运行在 KVM 宿主机上，负责宿主机预检、资源上报、�
 
 Agent 不依赖 systemd。发布包携带 `control.sh`，支持预检、启动、停止、重启、状态查询和日志跟踪。
 
-开发分支已增加 KVM 交付计划生成器，能够离线验证资源、镜像文件名、网桥白名单、IP 和凭据格式，并生成域 XML 与 cloud-init 文本。该能力目前仅返回内存中的计划，没有接入文件写入或 libvirt 执行。
+开发版已实现 `CREATE_INSTANCE` 和 `DELETE_INSTANCE` 执行器，包括计划校验、受控目录、qcow2 增量盘、cloud-init seed、域定义与启动、幂等重试、失败回滚和删除前所有权校验。写模式需要三项显式配置同时满足，默认配置仍为只读。
 
 ## 构建
 
@@ -40,6 +40,18 @@ chmod 600 conf/agent.env
 - 平台专用存储目录必须与存量虚机目录完全隔离。
 - 未携带合法平台元数据的虚拟机均视为外部资源。
 - 当前不对 node3 进行任何 KVM 写操作验证。
+
+## 写模式门禁
+
+只有同时设置以下三项配置，Agent 才会轮询并执行 KVM 任务：
+
+```dotenv
+AGENT_MODE=kvm
+KVM_WRITE_ENABLED=true
+KVM_WRITE_CONFIRMATION=enable-kvm-write
+```
+
+本仓库不会自动修改这三项配置。启用前还必须完成隔离测试机验证、镜像登记、网络参数和控制面任务协议联调。
 
 ## 文档同步规则
 

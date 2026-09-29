@@ -45,6 +45,11 @@ type ProvisionPlan struct {
 	BaseImagePath    string
 	DiskPath         string
 	SeedPath         string
+	DomainXMLPath    string
+	MetaDataPath     string
+	UserDataPath     string
+	NetworkDataPath  string
+	ManifestPath     string
 	DomainXML        string
 	CloudInitMeta    string
 	CloudInitUser    string
@@ -61,6 +66,11 @@ func (d *Driver) BuildProvisionPlan(spec CreateSpec) (ProvisionPlan, error) {
 		BaseImagePath:    filepath.Join(d.config.ImageRoot, spec.ImageFile),
 		DiskPath:         filepath.Join(instanceDir, "root.qcow2"),
 		SeedPath:         filepath.Join(instanceDir, "seed.iso"),
+		DomainXMLPath:    filepath.Join(instanceDir, "domain.xml"),
+		MetaDataPath:     filepath.Join(instanceDir, "meta-data"),
+		UserDataPath:     filepath.Join(instanceDir, "user-data"),
+		NetworkDataPath:  filepath.Join(instanceDir, "network-config"),
+		ManifestPath:     filepath.Join(instanceDir, "manifest.json"),
 		CloudInitMeta:    renderMetaData(spec),
 		CloudInitUser:    renderUserData(spec),
 		CloudInitNetwork: renderNetworkConfig(spec),
