@@ -67,6 +67,7 @@ type createTaskPayload struct {
 	MemoryMB         int      `json:"memory_mb"`
 	DiskGB           int      `json:"disk_gb"`
 	ImageFile        string   `json:"image_file"`
+	ImagePath        string   `json:"image_path"`
 	Bridge           string   `json:"bridge"`
 	MACAddress       string   `json:"mac_address"`
 	IPAddress        string   `json:"ip_address"`
@@ -101,7 +102,7 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 	}
 	spec := CreateSpec{
 		InstanceID: payload.InstanceID, Name: payload.Name, CPU: payload.CPU, MemoryMB: payload.MemoryMB,
-		DiskGB: payload.DiskGB, ImageFile: payload.ImageFile, Bridge: payload.Bridge, MACAddress: payload.MACAddress,
+		DiskGB: payload.DiskGB, ImageFile: payload.ImageFile, ImagePath: payload.ImagePath, Bridge: payload.Bridge, MACAddress: payload.MACAddress,
 		IPAddress: payload.IPAddress, PrefixLength: payload.PrefixLength, Gateway: payload.Gateway,
 		DNSServers: payload.DNSServers, Username: payload.Username, PasswordHash: payload.PasswordHash,
 		SSHAuthorized: payload.SSHAuthorizedKey,
@@ -136,6 +137,9 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 			return result, errors.New("existing managed domain is not in a restartable state")
 		}
 		return agentmodel.TaskResult{Success: true, ProviderRef: existing.ProviderUUID, IPAddress: spec.IPAddress}, nil
+	}
+	if err := d.ensureIPAddressAvailable(ctx, spec.IPAddress); err != nil {
+		return result, err
 	}
 
 	if err := d.validateBaseImage(plan.BaseImagePath); err != nil {
@@ -219,6 +223,18 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 		return result, err
 	}
 	return agentmodel.TaskResult{Success: true, ProviderRef: spec.InstanceID, IPAddress: spec.IPAddress}, nil
+}
+
+func (d *Driver) ensureIPAddressAvailable(ctx context.Context, address string) error {
+	output, err := d.runner.Run(ctx, d.config.PingPath, "-c", "1", "-W", "1", address)
+	if err == nil {
+		return fmt.Errorf("IP address %s is already in use: %s", address, strings.TrimSpace(string(output)))
+	}
+	var exitCoder interface{ ExitCode() int }
+	if errors.As(err, &exitCoder) && exitCoder.ExitCode() == 1 {
+		return nil
+	}
+	return fmt.Errorf("IP occupancy probe failed: %w", err)
 }
 
 func (d *Driver) prepareRuntimePath(path string, mode fs.FileMode) error {

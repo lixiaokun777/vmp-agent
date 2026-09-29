@@ -24,6 +24,7 @@ type Config struct {
 	VirshPath      string
 	QemuImgPath    string
 	SeedToolPath   string
+	PingPath       string
 	StorageRoot    string
 	ImageRoot      string
 	AllowedBridges []string
@@ -69,6 +70,9 @@ func New(config Config, runner Runner) (*Driver, error) {
 	}
 	if config.SeedToolPath == "" {
 		config.SeedToolPath = "/usr/bin/cloud-localds"
+	}
+	if config.PingPath == "" {
+		config.PingPath = "/usr/bin/ping"
 	}
 	if config.SafetyMemoryMB < 0 || config.CPUCap < 0 || config.MemoryCapMB < 0 || config.DiskCapGB < 0 {
 		return nil, errors.New("resource caps and safety memory must not be negative")
@@ -166,8 +170,8 @@ func (d *Driver) Inspect(ctx context.Context) (agentmodel.Snapshot, error) {
 }
 
 func (d *Driver) preflight(ctx context.Context) []agentmodel.Check {
-	checks := make([]agentmodel.Check, 0, 6+len(d.config.AllowedBridges))
-	for name, path := range map[string]string{"virsh": d.config.VirshPath, "qemu-img": d.config.QemuImgPath, "seed-tool": d.config.SeedToolPath} {
+	checks := make([]agentmodel.Check, 0, 7+len(d.config.AllowedBridges))
+	for name, path := range map[string]string{"virsh": d.config.VirshPath, "qemu-img": d.config.QemuImgPath, "seed-tool": d.config.SeedToolPath, "ping": d.config.PingPath} {
 		info, err := os.Stat(path)
 		checks = append(checks, agentmodel.Check{Name: name, OK: err == nil && !info.IsDir(), Message: checkMessage(path, err)})
 	}

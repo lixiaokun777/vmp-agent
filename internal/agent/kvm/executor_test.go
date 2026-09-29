@@ -26,6 +26,8 @@ func (r *executorRunner) Run(_ context.Context, name string, args ...string) ([]
 		return nil, errors.New("simulated command failure")
 	}
 	switch {
+	case strings.HasPrefix(command, "ping "):
+		return nil, noReplyError{}
 	case strings.Contains(command, "qemu-img info --output=json"):
 		return []byte(`{"format":"qcow2"}`), nil
 	case strings.Contains(command, "qemu-img create "):
@@ -77,6 +79,11 @@ func (r *executorRunner) Run(_ context.Context, name string, args ...string) ([]
 		return []byte("ok\n"), nil
 	}
 }
+
+type noReplyError struct{}
+
+func (noReplyError) Error() string { return "模拟目标无响应" }
+func (noReplyError) ExitCode() int { return 1 }
 
 func newWritableTestDriver(t *testing.T, runner *executorRunner) (*Driver, string) {
 	t.Helper()
@@ -287,4 +294,26 @@ func TestPowerActionRefusesExternalDomain(t *testing.T) {
 			t.Fatalf("shutdown command was issued: %s", command)
 		}
 	}
+}
+
+func TestCreateRefusesOccupiedIPAddress(t *testing.T) {
+	runner := &executorRunner{}
+	driver, _ := newWritableTestDriver(t, runner)
+	runner.commands = nil
+	occupied := &occupiedIPRunner{executorRunner: runner}
+	driver.runner = occupied
+	if _, err := driver.Execute(context.Background(), createTask()); err == nil || !strings.Contains(err.Error(), "already in use") {
+		t.Fatalf("expected occupied IP to be rejected, got %v", err)
+	}
+}
+
+type occupiedIPRunner struct {
+	*executorRunner
+}
+
+func (r *occupiedIPRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if filepath.Base(name) == "ping" {
+		return []byte("64 bytes from 10.200.9.21"), nil
+	}
+	return r.executorRunner.Run(ctx, name, args...)
 }

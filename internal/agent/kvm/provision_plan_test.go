@@ -56,6 +56,28 @@ func TestBuildProvisionPlanRejectsPathTraversal(t *testing.T) {
 	}
 }
 
+func TestBuildProvisionPlanAcceptsPathInsideImageRoot(t *testing.T) {
+	driver := &Driver{config: Config{StorageRoot: "/data/vmp", ImageRoot: "/data/images", AllowedBridges: []string{"br0"}}}
+	spec := validCreateSpec()
+	spec.ImagePath = "/data/images/ubuntu/ubuntu-24.04.qcow2"
+	plan, err := driver.BuildProvisionPlan(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.BaseImagePath != spec.ImagePath {
+		t.Fatalf("unexpected image path: %s", plan.BaseImagePath)
+	}
+}
+
+func TestBuildProvisionPlanRejectsPathOutsideImageRoot(t *testing.T) {
+	driver := &Driver{config: Config{StorageRoot: "/data/vmp", ImageRoot: "/data/images", AllowedBridges: []string{"br0"}}}
+	spec := validCreateSpec()
+	spec.ImagePath = "/etc/passwd"
+	if _, err := driver.BuildProvisionPlan(spec); err == nil {
+		t.Fatal("expected image path outside image root to be rejected")
+	}
+}
+
 func TestBuildProvisionPlanRejectsUnknownBridge(t *testing.T) {
 	driver := &Driver{config: Config{StorageRoot: "/data/vmp", ImageRoot: "/data/images", AllowedBridges: []string{"br0"}}}
 	spec := validCreateSpec()

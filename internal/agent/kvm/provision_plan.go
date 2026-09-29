@@ -28,6 +28,7 @@ type CreateSpec struct {
 	MemoryMB      int
 	DiskGB        int
 	ImageFile     string
+	ImagePath     string
 	Bridge        string
 	MACAddress    string
 	IPAddress     string
@@ -61,9 +62,13 @@ func (d *Driver) BuildProvisionPlan(spec CreateSpec) (ProvisionPlan, error) {
 		return ProvisionPlan{}, err
 	}
 	instanceDir := filepath.Join(d.config.StorageRoot, spec.InstanceID)
+	baseImagePath, err := d.resolveBaseImagePath(spec)
+	if err != nil {
+		return ProvisionPlan{}, err
+	}
 	plan := ProvisionPlan{
 		InstanceDir:      instanceDir,
-		BaseImagePath:    filepath.Join(d.config.ImageRoot, spec.ImageFile),
+		BaseImagePath:    baseImagePath,
 		DiskPath:         filepath.Join(instanceDir, "root.qcow2"),
 		SeedPath:         filepath.Join(instanceDir, "seed.iso"),
 		DomainXMLPath:    filepath.Join(instanceDir, "domain.xml"),
@@ -81,6 +86,23 @@ func (d *Driver) BuildProvisionPlan(spec CreateSpec) (ProvisionPlan, error) {
 	}
 	plan.DomainXML = domainXML
 	return plan, nil
+}
+
+func (d *Driver) resolveBaseImagePath(spec CreateSpec) (string, error) {
+	location := spec.ImagePath
+	if location == "" {
+		location = spec.ImageFile
+	}
+	path := location
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(d.config.ImageRoot, path)
+	}
+	path = filepath.Clean(path)
+	relative, err := filepath.Rel(filepath.Clean(d.config.ImageRoot), path)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", errors.New("image path must be a file inside the configured image root")
+	}
+	return path, nil
 }
 
 func (d *Driver) validateCreateSpec(spec CreateSpec) error {
