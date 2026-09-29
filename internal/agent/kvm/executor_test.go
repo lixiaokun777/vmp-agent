@@ -27,6 +27,9 @@ func (r *executorRunner) Run(_ context.Context, name string, args ...string) ([]
 	}
 	switch {
 	case strings.HasPrefix(command, "ping "):
+		if r.domainRunning {
+			return []byte("64 bytes from guest\n"), nil
+		}
 		return nil, noReplyError{}
 	case strings.Contains(command, "qemu-img info --output=json"):
 		return []byte(`{"format":"qcow2"}`), nil

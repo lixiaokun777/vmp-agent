@@ -107,6 +107,9 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 		DNSServers: payload.DNSServers, Username: payload.Username, PasswordHash: payload.PasswordHash,
 		SSHAuthorized: payload.SSHAuthorizedKey,
 	}
+	if spec.MACAddress == "" {
+		spec.MACAddress = stableMAC(spec.InstanceID)
+	}
 	plan, err := d.BuildProvisionPlan(spec)
 	if err != nil {
 		return result, err
@@ -135,6 +138,9 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 			}
 		default:
 			return result, errors.New("existing managed domain is not in a restartable state")
+		}
+		if err := d.waitForIPAddress(ctx, spec.IPAddress, 90*time.Second); err != nil {
+			return result, err
 		}
 		return agentmodel.TaskResult{Success: true, ProviderRef: existing.ProviderUUID, IPAddress: spec.IPAddress}, nil
 	}
@@ -222,6 +228,9 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 	if _, err := d.virshWrite(ctx, "start", spec.Name); err != nil {
 		return result, err
 	}
+	if err := d.waitForIPAddress(ctx, spec.IPAddress, 90*time.Second); err != nil {
+		return result, err
+	}
 	return agentmodel.TaskResult{Success: true, ProviderRef: spec.InstanceID, IPAddress: spec.IPAddress}, nil
 }
 
@@ -235,6 +244,31 @@ func (d *Driver) ensureIPAddressAvailable(ctx context.Context, address string) e
 		return nil
 	}
 	return fmt.Errorf("IP occupancy probe failed: %w", err)
+}
+
+// waitForIPAddress 在交付成功前确认虚机已真正加载静态网络配置。
+func (d *Driver) waitForIPAddress(ctx context.Context, address string, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		output, err := d.runner.Run(ctx, d.config.PingPath, "-c", "1", "-W", "1", address)
+		if err == nil {
+			return nil
+		}
+		var exitCoder interface{ ExitCode() int }
+		if !errors.As(err, &exitCoder) || exitCoder.ExitCode() != 1 {
+			return fmt.Errorf("IP readiness probe failed: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("instance IP %s did not become reachable within %s", address, timeout)
+		case <-ticker.C:
+		}
+	}
 }
 
 func (d *Driver) prepareRuntimePath(path string, mode fs.FileMode) error {

@@ -38,6 +38,9 @@ func TestBuildProvisionPlanOnlyRendersArtifacts(t *testing.T) {
 	if !strings.Contains(plan.CloudInitNetwork, "10.200.9.21/24") || !strings.Contains(plan.CloudInitNetwork, "10.200.9.1") {
 		t.Fatalf("unexpected network config: %s", plan.CloudInitNetwork)
 	}
+	if !strings.Contains(plan.CloudInitNetwork, "macaddress: '52:54:00:12:34:56'") || strings.Contains(plan.CloudInitNetwork, "set-name") {
+		t.Fatalf("network config must match the stable MAC without renaming the interface: %s", plan.CloudInitNetwork)
+	}
 	parsed, err := parseDomainXML([]byte(plan.DomainXML))
 	if err != nil {
 		t.Fatal(err)

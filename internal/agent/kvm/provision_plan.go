@@ -1,6 +1,7 @@
 package kvm
 
 import (
+	"crypto/sha256"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -86,6 +87,12 @@ func (d *Driver) BuildProvisionPlan(spec CreateSpec) (ProvisionPlan, error) {
 	}
 	plan.DomainXML = domainXML
 	return plan, nil
+}
+
+// stableMAC 在控制面未提供 MAC 时生成稳定地址，兼容升级前已创建的任务。
+func stableMAC(instanceID string) string {
+	digest := sha256.Sum256([]byte(instanceID))
+	return fmt.Sprintf("52:54:00:%02x:%02x:%02x", digest[0], digest[1], digest[2])
 }
 
 func (d *Driver) resolveBaseImagePath(spec CreateSpec) (string, error) {
@@ -320,7 +327,7 @@ func renderUserData(spec CreateSpec) string {
 
 func renderNetworkConfig(spec CreateSpec) string {
 	dns := strings.Join(spec.DNSServers, ", ")
-	return fmt.Sprintf("version: 2\nethernets:\n  eth0:\n    match:\n      name: 'en*'\n    set-name: eth0\n    addresses: [%s/%d]\n    routes:\n      - to: default\n        via: %s\n    nameservers:\n      addresses: [%s]\n", spec.IPAddress, spec.PrefixLength, spec.Gateway, dns)
+	return fmt.Sprintf("version: 2\nethernets:\n  primary:\n    match:\n      macaddress: '%s'\n    addresses: [%s/%d]\n    routes:\n      - to: default\n        via: %s\n    nameservers:\n      addresses: [%s]\n", strings.ToLower(spec.MACAddress), spec.IPAddress, spec.PrefixLength, spec.Gateway, dns)
 }
 
 func validMACAddress(value string) bool {
