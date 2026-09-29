@@ -28,6 +28,16 @@ func (r *executorRunner) Run(_ context.Context, name string, args ...string) ([]
 	switch {
 	case strings.Contains(command, "qemu-img info --output=json"):
 		return []byte(`{"format":"qcow2"}`), nil
+	case strings.Contains(command, "qemu-img create "):
+		if err := os.WriteFile(args[len(args)-2], []byte("disk"), 0o600); err != nil {
+			return nil, err
+		}
+		return []byte("created\n"), nil
+	case strings.Contains(command, "cloud-localds "):
+		if err := os.WriteFile(args[1], []byte("seed"), 0o600); err != nil {
+			return nil, err
+		}
+		return []byte("created\n"), nil
 	case strings.Contains(command, " list --all --name"):
 		if r.domainPresent {
 			return []byte("lease-dev-001\n"), nil
@@ -117,6 +127,15 @@ func TestExecuteCreateAndDeleteManagedInstance(t *testing.T) {
 	for _, name := range []string{"manifest.json", "domain.xml", "meta-data", "user-data", "network-config"} {
 		if _, err := os.Stat(filepath.Join(instanceDir, name)); err != nil {
 			t.Fatalf("missing %s: %v", name, err)
+		}
+	}
+	for path, mode := range map[string]os.FileMode{instanceDir: 0o750, filepath.Join(instanceDir, "root.qcow2"): 0o660, filepath.Join(instanceDir, "seed.iso"): 0o640} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != mode {
+			t.Fatalf("%s mode = %o, want %o", filepath.Base(path), info.Mode().Perm(), mode)
 		}
 	}
 	if !runner.domainPresent || !runner.domainRunning {

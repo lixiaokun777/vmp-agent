@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -31,6 +32,7 @@ type Config struct {
 	DiskCapGB      int
 	SafetyMemoryMB int
 	WriteEnabled   bool
+	RuntimeGroup   string
 }
 
 type Runner interface {
@@ -49,9 +51,10 @@ func (CommandRunner) Run(ctx context.Context, name string, args ...string) ([]by
 }
 
 type Driver struct {
-	config Config
-	runner Runner
-	files  FileSystem
+	config     Config
+	runner     Runner
+	files      FileSystem
+	runtimeGID int
 }
 
 func New(config Config, runner Runner) (*Driver, error) {
@@ -81,7 +84,18 @@ func New(config Config, runner Runner) (*Driver, error) {
 	if runner == nil {
 		runner = CommandRunner{}
 	}
-	return &Driver{config: config, runner: runner, files: OSFileSystem{}}, nil
+	runtimeGID := os.Getgid()
+	if config.RuntimeGroup != "" {
+		group, err := user.LookupGroup(config.RuntimeGroup)
+		if err != nil {
+			return nil, fmt.Errorf("lookup KVM runtime group: %w", err)
+		}
+		runtimeGID, err = strconv.Atoi(group.Gid)
+		if err != nil || runtimeGID < 0 {
+			return nil, errors.New("KVM runtime group has an invalid gid")
+		}
+	}
+	return &Driver{config: config, runner: runner, files: OSFileSystem{}, runtimeGID: runtimeGID}, nil
 }
 
 func (d *Driver) Mode() string {

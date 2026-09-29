@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os/user"
 	"reflect"
 	"testing"
 )
@@ -23,9 +24,18 @@ func TestKVMWriteModeRequiresExplicitConfirmation(t *testing.T) {
 }
 
 func TestKVMWriteModeCanBeExplicitlyEnabled(t *testing.T) {
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := user.LookupGroupId(current.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("AGENT_MODE", "kvm")
 	t.Setenv("KVM_WRITE_ENABLED", "true")
 	t.Setenv("KVM_WRITE_CONFIRMATION", "enable-kvm-write")
+	t.Setenv("KVM_RUNTIME_GROUP", group.Name)
 	driver, err := buildDriver()
 	if err != nil {
 		t.Fatal(err)

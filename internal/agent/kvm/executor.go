@@ -21,6 +21,8 @@ type FileSystem interface {
 	ReadFile(string) ([]byte, error)
 	Stat(string) (fs.FileInfo, error)
 	Lstat(string) (fs.FileInfo, error)
+	Chmod(string, fs.FileMode) error
+	Chown(string, int, int) error
 	RemoveAll(string) error
 }
 
@@ -44,6 +46,14 @@ func (OSFileSystem) Stat(path string) (fs.FileInfo, error) {
 
 func (OSFileSystem) Lstat(path string) (fs.FileInfo, error) {
 	return os.Lstat(path)
+}
+
+func (OSFileSystem) Chmod(path string, mode fs.FileMode) error {
+	return os.Chmod(path, mode)
+}
+
+func (OSFileSystem) Chown(path string, uid, gid int) error {
+	return os.Chown(path, uid, gid)
 }
 
 func (OSFileSystem) RemoveAll(path string) error {
@@ -139,6 +149,9 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 	if err := d.files.Mkdir(plan.InstanceDir, 0o700); err != nil {
 		return result, err
 	}
+	if err := d.prepareRuntimePath(plan.InstanceDir, 0o750); err != nil {
+		return result, err
+	}
 
 	domainDefined := false
 	defer func() {
@@ -189,7 +202,13 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 	if _, err := d.runner.Run(ctx, d.config.QemuImgPath, "create", "-f", "qcow2", "-F", imageFormat, "-b", plan.BaseImagePath, plan.DiskPath, fmt.Sprintf("%dG", spec.DiskGB)); err != nil {
 		return result, err
 	}
+	if err := d.prepareRuntimePath(plan.DiskPath, 0o660); err != nil {
+		return result, err
+	}
 	if err := d.createSeedImage(ctx, plan); err != nil {
+		return result, err
+	}
+	if err := d.prepareRuntimePath(plan.SeedPath, 0o640); err != nil {
 		return result, err
 	}
 	if _, err := d.virshWrite(ctx, "define", plan.DomainXMLPath); err != nil {
@@ -200,6 +219,16 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 		return result, err
 	}
 	return agentmodel.TaskResult{Success: true, ProviderRef: spec.InstanceID, IPAddress: spec.IPAddress}, nil
+}
+
+func (d *Driver) prepareRuntimePath(path string, mode fs.FileMode) error {
+	if err := d.files.Chown(path, -1, d.runtimeGID); err != nil {
+		return fmt.Errorf("set KVM runtime group on %s: %w", filepath.Base(path), err)
+	}
+	if err := d.files.Chmod(path, mode); err != nil {
+		return fmt.Errorf("set KVM runtime permissions on %s: %w", filepath.Base(path), err)
+	}
+	return nil
 }
 
 func (d *Driver) executeDelete(ctx context.Context, task agentmodel.Task) (agentmodel.TaskResult, error) {
