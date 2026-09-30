@@ -2,6 +2,7 @@ package kvm
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,6 +88,13 @@ type deleteTaskPayload struct {
 type powerTaskPayload struct {
 	InstanceID string `json:"instance_id"`
 	Name       string `json:"name"`
+}
+
+type resetPasswordTaskPayload struct {
+	InstanceID   string `json:"instance_id"`
+	Name         string `json:"name"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash"`
 }
 
 type instanceManifest struct {
@@ -381,6 +389,54 @@ func (d *Driver) executePowerAction(ctx context.Context, task agentmodel.Task) (
 		}
 	default:
 		return agentmodel.TaskResult{}, fmt.Errorf("unsupported power task type %q", task.Type)
+	}
+	return agentmodel.TaskResult{Success: true, ProviderRef: payload.InstanceID}, nil
+}
+
+// executeResetPassword 通过 QEMU Guest Agent 写入加密后的系统密码。
+// 任务负载只包含 crypt 摘要，控制面和 Agent 均不会持久化明文密码。
+func (d *Driver) executeResetPassword(ctx context.Context, task agentmodel.Task) (agentmodel.TaskResult, error) {
+	var payload resetPasswordTaskPayload
+	if err := decodeTaskPayload(task.Payload, &payload); err != nil {
+		return agentmodel.TaskResult{}, err
+	}
+	if !instanceIDPattern.MatchString(payload.InstanceID) || !namePattern.MatchString(payload.Name) || !usernamePattern.MatchString(payload.Username) || !passwordHashPattern.MatchString(payload.PasswordHash) {
+		return agentmodel.TaskResult{}, errors.New("invalid password reset task")
+	}
+	instanceDir := filepath.Join(d.config.StorageRoot, payload.InstanceID)
+	if _, err := d.validateInstanceDirectory(payload.InstanceID, payload.Name, instanceDir, false); err != nil {
+		return agentmodel.TaskResult{}, err
+	}
+	domain, err := d.findDomain(ctx, payload.Name)
+	if err != nil {
+		return agentmodel.TaskResult{}, err
+	}
+	if domain == nil {
+		return agentmodel.TaskResult{}, errors.New("managed domain does not exist")
+	}
+	if err := verifyManagedDomain(*domain, payload.InstanceID, payload.Name); err != nil {
+		return agentmodel.TaskResult{}, err
+	}
+	stateOutput, err := d.virsh(ctx, "domstate", payload.Name)
+	if err != nil {
+		return agentmodel.TaskResult{}, err
+	}
+	if normalizeState(string(stateOutput)) != "RUNNING" {
+		return agentmodel.TaskResult{}, errors.New("password can only be reset while the domain is running")
+	}
+	command, err := json.Marshal(map[string]any{
+		"execute": "guest-set-user-password",
+		"arguments": map[string]any{
+			"username": payload.Username,
+			"password": base64.StdEncoding.EncodeToString([]byte(payload.PasswordHash)),
+			"crypted":  true,
+		},
+	})
+	if err != nil {
+		return agentmodel.TaskResult{}, err
+	}
+	if _, err := d.virshWrite(ctx, "qemu-agent-command", payload.Name, string(command)); err != nil {
+		return agentmodel.TaskResult{}, fmt.Errorf("QEMU Guest Agent password reset failed: %w", err)
 	}
 	return agentmodel.TaskResult{Success: true, ProviderRef: payload.InstanceID}, nil
 }

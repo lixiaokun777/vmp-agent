@@ -17,6 +17,7 @@ var (
 	namePattern         = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
 	imageNamePattern    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
 	passwordHashPattern = regexp.MustCompile(`^\$[a-zA-Z0-9]+\$[^\r\n']+$`)
+	usernamePattern     = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 	sshKeyPattern       = regexp.MustCompile(`^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)) [a-zA-Z0-9+/]+={0,3}( [a-zA-Z0-9@._-]+)?$`)
 )
 
@@ -211,7 +212,18 @@ type generatedFeatures struct {
 type generatedDevices struct {
 	Disks     []generatedDisk    `xml:"disk"`
 	Interface generatedInterface `xml:"interface"`
+	Channel   generatedChannel   `xml:"channel"`
 	Graphics  generatedGraphics  `xml:"graphics"`
+}
+
+type generatedChannel struct {
+	Type   string                 `xml:"type,attr"`
+	Target generatedChannelTarget `xml:"target"`
+}
+
+type generatedChannelTarget struct {
+	Type string `xml:"type,attr"`
+	Name string `xml:"name,attr"`
 }
 
 type generatedDisk struct {
@@ -282,6 +294,7 @@ func renderDomainXML(spec CreateSpec, diskPath, seedPath string) (string, error)
 				{Type: "file", Device: "cdrom", Driver: generatedDriver{Name: "qemu", Type: "raw"}, Source: generatedSource{File: seedPath}, Target: generatedTarget{Dev: "sda", Bus: "sata"}, ReadOnly: &struct{}{}},
 			},
 			Interface: generatedInterface{Type: "bridge", Source: generatedBridge{Bridge: spec.Bridge}, Model: generatedNICModel{Type: "virtio"}},
+			Channel:   generatedChannel{Type: "unix", Target: generatedChannelTarget{Type: "virtio", Name: "org.qemu.guest_agent.0"}},
 			Graphics:  generatedGraphics{Type: "vnc", AutoPort: "yes", Listen: "127.0.0.1"},
 		},
 	}
@@ -322,6 +335,8 @@ func renderUserData(spec CreateSpec) string {
 	} else {
 		builder.WriteString("false\n")
 	}
+	// Guest Agent 必须预装在平台镜像中，创建流程不能依赖虚拟机访问公网软件源。
+	builder.WriteString("runcmd:\n  - [systemctl, start, qemu-guest-agent]\n")
 	return builder.String()
 }
 

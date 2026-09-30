@@ -120,6 +120,8 @@ func (d *Driver) Execute(ctx context.Context, task agentmodel.Task) (agentmodel.
 		return d.executeDelete(ctx, task)
 	case "START_INSTANCE", "STOP_INSTANCE", "REBOOT_INSTANCE":
 		return d.executePowerAction(ctx, task)
+	case "RESET_INSTANCE_PASSWORD":
+		return d.executeResetPassword(ctx, task)
 	default:
 		return agentmodel.TaskResult{}, fmt.Errorf("unsupported KVM task type %q", task.Type)
 	}

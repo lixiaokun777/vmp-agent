@@ -48,6 +48,15 @@ func TestBuildProvisionPlanOnlyRendersArtifacts(t *testing.T) {
 	if parsed.Ownership != "MANAGED" || parsed.PlatformInstanceID != validCreateSpec().InstanceID {
 		t.Fatalf("generated metadata is not recognized: %#v\n%s", parsed, plan.DomainXML)
 	}
+	if !strings.Contains(plan.DomainXML, "org.qemu.guest_agent.0") {
+		t.Fatalf("domain does not include QEMU Guest Agent channel: %s", plan.DomainXML)
+	}
+	if !strings.Contains(plan.CloudInitUser, "qemu-guest-agent") {
+		t.Fatalf("cloud-init does not start QEMU Guest Agent: %s", plan.CloudInitUser)
+	}
+	if strings.Contains(plan.CloudInitUser, "packages:") {
+		t.Fatalf("cloud-init must not depend on a public package repository: %s", plan.CloudInitUser)
+	}
 }
 
 func TestBuildProvisionPlanRejectsPathTraversal(t *testing.T) {

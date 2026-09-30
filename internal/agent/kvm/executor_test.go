@@ -190,6 +190,44 @@ func TestCreateRetryIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestResetPasswordUsesEncryptedGuestAgentPayload(t *testing.T) {
+	runner := &executorRunner{}
+	driver, _ := newWritableTestDriver(t, runner)
+	created, err := driver.Execute(context.Background(), createTask())
+	if err != nil {
+		t.Fatal(err)
+	}
+	passwordHash := "$6$rounds=4096$testsalt$encrypted-value"
+	result, err := driver.Execute(context.Background(), agentmodel.Task{
+		ID:   "task-reset",
+		Type: "RESET_INSTANCE_PASSWORD",
+		Payload: map[string]any{
+			"instance_id":   created.ProviderRef,
+			"name":          "lease-dev-001",
+			"username":      "ubuntu",
+			"password_hash": passwordHash,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success {
+		t.Fatalf("unexpected reset result: %#v", result)
+	}
+	found := false
+	for _, command := range runner.commands {
+		if strings.Contains(command, "qemu-agent-command lease-dev-001") {
+			found = true
+			if strings.Contains(command, "encrypted-value") {
+				t.Fatal("password hash must be base64 encoded before sending to QEMU Guest Agent")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("QEMU Guest Agent command was not executed")
+	}
+}
+
 func TestCreateRollsBackAfterStartFailure(t *testing.T) {
 	runner := &executorRunner{failCommand: " start "}
 	driver, storageRoot := newWritableTestDriver(t, runner)

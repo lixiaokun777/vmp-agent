@@ -11,6 +11,8 @@
 
 ## 开发中
 
+- 增加 `RESET_INSTANCE_PASSWORD` 任务，通过 QEMU Guest Agent 写入 crypt 摘要，全链路不持久化明文密码。
+- 新建实例增加 QEMU Guest Agent 通道，并由 cloud-init 启动平台镜像中预装的服务，不再在线安装软件包。
 - cloud-init 网络配置改为按稳定 MAC 匹配网卡，不再在首次启动时把 `ens3` 重命名为 `eth0`。
 - 创建任务只有在虚机 IP 通过最长 90 秒的可达性确认后才上报成功。
 - 增加纯计算的 KVM 交付计划生成器。
