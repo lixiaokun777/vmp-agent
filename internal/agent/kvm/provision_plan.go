@@ -214,6 +214,8 @@ type generatedDevices struct {
 	Interface generatedInterface `xml:"interface"`
 	Channel   generatedChannel   `xml:"channel"`
 	Graphics  generatedGraphics  `xml:"graphics"`
+	Serial    generatedSerial    `xml:"serial"`
+	Console   generatedConsole   `xml:"console"`
 }
 
 type generatedChannel struct {
@@ -274,6 +276,26 @@ type generatedGraphics struct {
 	Listen   string `xml:"listen,attr"`
 }
 
+type generatedSerial struct {
+	Type   string                `xml:"type,attr"`
+	Target generatedSerialTarget `xml:"target"`
+}
+
+type generatedSerialTarget struct {
+	Type string `xml:"type,attr"`
+	Port int    `xml:"port,attr"`
+}
+
+type generatedConsole struct {
+	Type   string                 `xml:"type,attr"`
+	Target generatedConsoleTarget `xml:"target"`
+}
+
+type generatedConsoleTarget struct {
+	Type string `xml:"type,attr"`
+	Port int    `xml:"port,attr"`
+}
+
 func renderDomainXML(spec CreateSpec, diskPath, seedPath string) (string, error) {
 	domain := generatedDomain{
 		Type:   "kvm",
@@ -296,6 +318,8 @@ func renderDomainXML(spec CreateSpec, diskPath, seedPath string) (string, error)
 			Interface: generatedInterface{Type: "bridge", Source: generatedBridge{Bridge: spec.Bridge}, Model: generatedNICModel{Type: "virtio"}},
 			Channel:   generatedChannel{Type: "unix", Target: generatedChannelTarget{Type: "virtio", Name: "org.qemu.guest_agent.0"}},
 			Graphics:  generatedGraphics{Type: "vnc", AutoPort: "yes", Listen: "127.0.0.1"},
+			Serial:    generatedSerial{Type: "pty", Target: generatedSerialTarget{Type: "isa-serial", Port: 0}},
+			Console:   generatedConsole{Type: "pty", Target: generatedConsoleTarget{Type: "serial", Port: 0}},
 		},
 	}
 	if spec.MACAddress != "" {

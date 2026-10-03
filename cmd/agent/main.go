@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 
 	agentmodel "vmp-agent/internal/agent"
 	"vmp-agent/internal/agent/kvm"
+	agentconsole "vmp-agent/internal/console"
 )
 
 type Agent struct {
@@ -25,6 +27,7 @@ type Agent struct {
 	Client                                              *http.Client
 	Driver                                              agentmodel.Driver
 	Snapshot                                            agentmodel.Snapshot
+	ConsolePublicURL                                    string
 }
 
 func main() {
@@ -39,7 +42,7 @@ func main() {
 		runPreflight(ctx, driver)
 		return
 	}
-	a := &Agent{BaseURL: env("CONTROL_PLANE_URL", "http://localhost:8080"), BootstrapToken: env("AGENT_BOOTSTRAP_TOKEN", "dev-bootstrap-token"), RuntimeToken: env("AGENT_RUNTIME_TOKEN", "dev-agent-token"), Name: env("AGENT_NAME", "dev-kvm-simulator"), Client: &http.Client{Timeout: 15 * time.Second}, Driver: driver}
+	a := &Agent{BaseURL: env("CONTROL_PLANE_URL", "http://localhost:8080"), BootstrapToken: env("AGENT_BOOTSTRAP_TOKEN", "dev-bootstrap-token"), RuntimeToken: env("AGENT_RUNTIME_TOKEN", "dev-agent-token"), Name: env("AGENT_NAME", "dev-kvm-simulator"), Client: &http.Client{Timeout: 15 * time.Second}, Driver: driver, ConsolePublicURL: os.Getenv("CONSOLE_PUBLIC_URL")}
 	if err := a.refreshInventory(ctx); err != nil {
 		slog.Error("initial host inspection failed", "error", err)
 		os.Exit(2)
@@ -57,6 +60,25 @@ func main() {
 		}
 	}
 	slog.Info("agent registered", "host_id", a.HostID, "mode", a.Driver.Mode(), "domains", len(a.Snapshot.Domains), "status", a.Snapshot.Status)
+	if listenAddress := os.Getenv("CONSOLE_LISTEN_ADDR"); listenAddress != "" {
+		secret := os.Getenv("CONSOLE_SIGNING_KEY")
+		if len(secret) < 32 {
+			slog.Error("控制台签名密钥不能少于 32 个字符")
+			os.Exit(2)
+		}
+		key := sha256.Sum256([]byte(secret))
+		consoleServer, err := agentconsole.New(agentconsole.Config{ListenAddress: listenAddress, HostID: a.HostID, SigningKey: key[:], AllowedOrigins: splitCSV(os.Getenv("CONSOLE_ALLOWED_ORIGINS")), VirshPath: env("KVM_VIRSH_PATH", "/usr/bin/virsh"), LibvirtURI: env("KVM_LIBVIRT_URI", "qemu:///system")})
+		if err != nil {
+			slog.Error("控制台代理配置无效", "error", err)
+			os.Exit(2)
+		}
+		go func() {
+			if err := consoleServer.ListenAndServe(ctx); err != nil {
+				slog.Error("控制台代理退出", "error", err)
+				stop()
+			}
+		}()
+	}
 	heartbeat := time.NewTicker(10 * time.Second)
 	inventory := time.NewTicker(60 * time.Second)
 	poll := time.NewTicker(2 * time.Second)
@@ -121,6 +143,7 @@ func (a *Agent) refreshInventory(ctx context.Context) error {
 		return err
 	}
 	a.Snapshot = snapshot
+	a.Snapshot.Facts.ConsoleURL = a.ConsolePublicURL
 	return nil
 }
 

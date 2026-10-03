@@ -11,6 +11,8 @@
 
 ## 开发中
 
+- 新增可选的 VNC/串口 WebSocket 代理，校验控制面 HMAC 短时票据和浏览器来源。
+- 新建 KVM 域默认增加 PTY 串口设备，VNC 继续只监听宿主机回环地址。
 - 增加 `RESET_INSTANCE_PASSWORD` 任务，通过 QEMU Guest Agent 写入 crypt 摘要，全链路不持久化明文密码。
 - 新建实例增加 QEMU Guest Agent 通道，并由 cloud-init 启动平台镜像中预装的服务，不再在线安装软件包。
 - cloud-init 网络配置改为按稳定 MAC 匹配网卡，不再在首次启动时把 `ens3` 重命名为 `eth0`。

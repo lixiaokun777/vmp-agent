@@ -34,6 +34,7 @@ type HostFacts struct {
 	TotalMemoryMB     int      `json:"total_memory_mb"`
 	AvailableMemoryMB int      `json:"available_memory_mb"`
 	StorageFreeGB     int      `json:"storage_free_gb"`
+	ConsoleURL        string   `json:"console_url,omitempty"`
 }
 
 type Domain struct {

@@ -51,6 +51,12 @@ func TestBuildProvisionPlanOnlyRendersArtifacts(t *testing.T) {
 	if !strings.Contains(plan.DomainXML, "org.qemu.guest_agent.0") {
 		t.Fatalf("domain does not include QEMU Guest Agent channel: %s", plan.DomainXML)
 	}
+	if !strings.Contains(plan.DomainXML, `<graphics type="vnc" autoport="yes" listen="127.0.0.1"></graphics>`) {
+		t.Fatalf("VNC 必须只监听宿主机回环地址: %s", plan.DomainXML)
+	}
+	if !strings.Contains(plan.DomainXML, `<serial type="pty">`) || !strings.Contains(plan.DomainXML, `<console type="pty">`) {
+		t.Fatalf("域未包含 PTY 串口和控制台设备: %s", plan.DomainXML)
+	}
 	if !strings.Contains(plan.CloudInitUser, "qemu-guest-agent") {
 		t.Fatalf("cloud-init does not start QEMU Guest Agent: %s", plan.CloudInitUser)
 	}
