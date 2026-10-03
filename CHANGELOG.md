@@ -11,6 +11,7 @@
 
 ## 开发中
 
+- 控制台票据改为 5 分钟有效且连接前必须由控制面原子核销，重复连接会被拒绝。
 - 新增可选的 VNC/串口 WebSocket 代理，校验控制面 HMAC 短时票据和浏览器来源。
 - 新建 KVM 域默认增加 PTY 串口设备，VNC 继续只监听宿主机回环地址。
 - 增加 `RESET_INSTANCE_PASSWORD` 任务，通过 QEMU Guest Agent 写入 crypt 摘要，全链路不持久化明文密码。

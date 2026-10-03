@@ -67,7 +67,7 @@ func main() {
 			os.Exit(2)
 		}
 		key := sha256.Sum256([]byte(secret))
-		consoleServer, err := agentconsole.New(agentconsole.Config{ListenAddress: listenAddress, HostID: a.HostID, SigningKey: key[:], AllowedOrigins: splitCSV(os.Getenv("CONSOLE_ALLOWED_ORIGINS")), VirshPath: env("KVM_VIRSH_PATH", "/usr/bin/virsh"), LibvirtURI: env("KVM_LIBVIRT_URI", "qemu:///system")})
+		consoleServer, err := agentconsole.New(agentconsole.Config{ListenAddress: listenAddress, HostID: a.HostID, SigningKey: key[:], AllowedOrigins: splitCSV(os.Getenv("CONSOLE_ALLOWED_ORIGINS")), VirshPath: env("KVM_VIRSH_PATH", "/usr/bin/virsh"), LibvirtURI: env("KVM_LIBVIRT_URI", "qemu:///system"), ControlPlaneURL: a.BaseURL, RuntimeToken: a.RuntimeToken, HTTPClient: a.Client})
 		if err != nil {
 			slog.Error("控制台代理配置无效", "error", err)
 			os.Exit(2)

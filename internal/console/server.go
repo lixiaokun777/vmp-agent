@@ -1,6 +1,7 @@
 package console
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -26,12 +27,15 @@ import (
 var domainNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
 
 type Config struct {
-	ListenAddress  string
-	HostID         string
-	SigningKey     []byte
-	AllowedOrigins []string
-	VirshPath      string
-	LibvirtURI     string
+	ListenAddress   string
+	HostID          string
+	SigningKey      []byte
+	AllowedOrigins  []string
+	VirshPath       string
+	LibvirtURI      string
+	ControlPlaneURL string
+	RuntimeToken    string
+	HTTPClient      *http.Client
 }
 
 type Server struct {
@@ -60,6 +64,12 @@ func New(config Config) (*Server, error) {
 	}
 	if config.LibvirtURI == "" {
 		config.LibvirtURI = "qemu:///system"
+	}
+	if config.ControlPlaneURL == "" || config.RuntimeToken == "" {
+		return nil, errors.New("控制台需要控制面地址和 Agent 运行令牌")
+	}
+	if config.HTTPClient == nil {
+		config.HTTPClient = &http.Client{Timeout: 5 * time.Second}
 	}
 	return &Server{config: config}, nil
 }
@@ -110,7 +120,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, mode string) 
 		return result, false
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil || json.Unmarshal(payload, &result) != nil || result.ExpiresAt < time.Now().Unix() || result.ExpiresAt > time.Now().Add(3*time.Minute).Unix() {
+	if err != nil || json.Unmarshal(payload, &result) != nil || result.ExpiresAt < time.Now().Unix() || result.ExpiresAt > time.Now().Add(6*time.Minute).Unix() {
 		http.Error(w, "控制台票据已过期或格式无效", http.StatusUnauthorized)
 		return result, false
 	}
@@ -118,7 +128,35 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, mode string) 
 		http.Error(w, "控制台票据与当前宿主机不匹配", http.StatusForbidden)
 		return result, false
 	}
+	if err := s.consume(r.Context(), result); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return ticket{}, false
+	}
 	return result, true
+}
+
+// consume 在控制面原子核销票据，同一 session_id 只有第一个连接能够成功。
+func (s *Server) consume(ctx context.Context, value ticket) error {
+	payload, err := json.Marshal(map[string]string{"mode": value.Mode, "domain": value.Domain})
+	if err != nil {
+		return errors.New("无法生成控制台核销请求")
+	}
+	endpoint := strings.TrimRight(s.config.ControlPlaneURL, "/") + "/api/v1/agents/" + url.PathEscape(s.config.HostID) + "/console-sessions/" + url.PathEscape(value.SessionID) + "/consume"
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return errors.New("无法创建控制台核销请求")
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+s.config.RuntimeToken)
+	response, err := s.config.HTTPClient.Do(request)
+	if err != nil {
+		return errors.New("控制面暂时无法核销控制台票据")
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return errors.New("控制台票据已使用、已过期或已被撤销")
+	}
+	return nil
 }
 
 func originAllowed(origin string, allowed []string) bool {
