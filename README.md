@@ -25,6 +25,8 @@ go test ./...
 
 ## 部署
 
+Ubuntu KVM 宿主机需要提前安装 `libvirt-clients`、`qemu-utils`、`cloud-image-utils` 或 `genisoimage`，并准备独立的实例目录、基础镜像目录和 Linux bridge。
+
 ```bash
 tar -xzf vmlease-agent-linux-amd64.tar.gz
 cd vmlease-agent
@@ -34,7 +36,7 @@ chmod 600 conf/agent.env
 ./control.sh start
 ```
 
-详细步骤见 `docs/部署与运维.md`，所有配置项见 `docs/配置参考.md`。
+详细的依赖安装、目录隔离、只读纳管、写模式验收、控制台、升级回滚和排障步骤见 `docs/部署与运维.md`，所有配置项见 `docs/配置参考.md`。
 
 ## 安全原则
 
