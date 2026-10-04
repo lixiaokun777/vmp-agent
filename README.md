@@ -1,5 +1,7 @@
 # VMP Agent
 
+[GitHub Releases](https://github.com/lixiaokun777/vmp-agent/releases) · [部署与运维](docs/部署与运维.md)
+
 VMP Agent 运行在 KVM 宿主机上，负责宿主机预检、资源上报、存量虚拟机发现和平台任务执行。真实 KVM 驱动默认只读，只有显式打开三重写模式门禁后才执行写操作。
 
 ## 运行模式
@@ -63,3 +65,7 @@ KVM_WRITE_CONFIRMATION=enable-kvm-write
 ## 文档同步规则
 
 驱动行为、配置、发布包、控制面协议或运维命令变更时，同一次提交必须更新 `README.md`、`docs/`、配置示例和 `CHANGELOG.md`。项目内人工编写的注释统一使用中文。
+
+## 开源与贡献
+
+项目采用 [Apache License 2.0](LICENSE)。提交改进前请阅读 [参与贡献](CONTRIBUTING.md)；安全问题请按 [安全策略](SECURITY.md) 私下报告。
