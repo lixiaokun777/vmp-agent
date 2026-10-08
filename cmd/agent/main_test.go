@@ -1,9 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"os/user"
 	"reflect"
 	"testing"
+
+	"vmp-agent/internal/agent/kvm"
 )
 
 func TestSplitCSV(t *testing.T) {
@@ -11,6 +14,13 @@ func TestSplitCSV(t *testing.T) {
 	want := []string{"br0", "br-dev"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("splitCSV() = %#v, want %#v", got, want)
+	}
+}
+
+func TestTaskFailureResultMarksOccupiedIPAddress(t *testing.T) {
+	result := taskFailureResult(fmt.Errorf("probe failed: %w", kvm.ErrIPAddressInUse))
+	if result.Success || result.ErrorCode != "IP_ADDRESS_IN_USE" {
+		t.Fatalf("unexpected task result: %#v", result)
 	}
 }
 

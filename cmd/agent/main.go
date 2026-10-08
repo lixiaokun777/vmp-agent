@@ -173,9 +173,17 @@ func (a *Agent) poll(ctx context.Context) error {
 	slog.Info("executing task", "task_id", task.ID, "type", task.Type, "driver", a.Driver.Mode())
 	result, executeErr := a.Driver.Execute(ctx, task)
 	if executeErr != nil {
-		result = agentmodel.TaskResult{Success: false, Error: executeErr.Error()}
+		result = taskFailureResult(executeErr)
 	}
 	return a.request(ctx, "POST", "/api/v1/agents/"+a.HostID+"/tasks/"+task.ID+"/result", result, nil, "Authorization", "Bearer "+a.RuntimeToken)
+}
+
+func taskFailureResult(executeErr error) agentmodel.TaskResult {
+	result := agentmodel.TaskResult{Success: false, Error: executeErr.Error()}
+	if errors.Is(executeErr, kvm.ErrIPAddressInUse) {
+		result.ErrorCode = "IP_ADDRESS_IN_USE"
+	}
+	return result
 }
 
 var errNoContent = errors.New("no content")

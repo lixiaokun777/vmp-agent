@@ -165,6 +165,18 @@ func TestExecuteCreateAndDeleteManagedInstance(t *testing.T) {
 	}
 }
 
+func TestCreateRejectsOccupiedIPAddressBeforeWritingFiles(t *testing.T) {
+	runner := &executorRunner{domainRunning: true}
+	driver, storageRoot := newWritableTestDriver(t, runner)
+	_, err := driver.Execute(context.Background(), createTask())
+	if !errors.Is(err, ErrIPAddressInUse) {
+		t.Fatalf("期望返回 IP 已占用错误，实际为：%v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(storageRoot, "123e4567-e89b-42d3-a456-426614174000")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("发现 IP 已占用后仍创建了实例目录：%v", statErr)
+	}
+}
+
 func TestCreateRetryIsIdempotent(t *testing.T) {
 	runner := &executorRunner{}
 	driver, _ := newWritableTestDriver(t, runner)

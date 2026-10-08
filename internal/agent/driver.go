@@ -64,5 +64,6 @@ type TaskResult struct {
 	Success     bool   `json:"success"`
 	ProviderRef string `json:"provider_ref,omitempty"`
 	IPAddress   string `json:"ip_address,omitempty"`
+	ErrorCode   string `json:"error_code,omitempty"`
 	Error       string `json:"error,omitempty"`
 }

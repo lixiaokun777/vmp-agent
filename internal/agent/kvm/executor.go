@@ -15,6 +15,9 @@ import (
 	agentmodel "vmp-agent/internal/agent"
 )
 
+// ErrIPAddressInUse 表示候选 IP 在创建虚拟机前已能响应 ICMP 探测。
+var ErrIPAddressInUse = errors.New("IP address is already in use")
+
 // FileSystem 将受控目录操作与交付流程隔离，便于在临时目录中完整测试。
 type FileSystem interface {
 	Mkdir(string, fs.FileMode) error
@@ -245,7 +248,7 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 func (d *Driver) ensureIPAddressAvailable(ctx context.Context, address string) error {
 	output, err := d.runner.Run(ctx, d.config.PingPath, "-c", "1", "-W", "1", address)
 	if err == nil {
-		return fmt.Errorf("IP address %s is already in use: %s", address, strings.TrimSpace(string(output)))
+		return fmt.Errorf("%w: %s: %s", ErrIPAddressInUse, address, strings.TrimSpace(string(output)))
 	}
 	var exitCoder interface{ ExitCode() int }
 	if errors.As(err, &exitCoder) && exitCoder.ExitCode() == 1 {
