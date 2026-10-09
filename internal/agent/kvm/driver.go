@@ -1,18 +1,25 @@
 package kvm
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	agentmodel "vmp-agent/internal/agent"
 )
@@ -20,20 +27,27 @@ import (
 const metadataNamespace = "https://vmlease.local/xmlns/domain/1.0"
 
 type Config struct {
-	LibvirtURI     string
-	VirshPath      string
-	QemuImgPath    string
-	SeedToolPath   string
-	PingPath       string
-	StorageRoot    string
-	ImageRoot      string
-	AllowedBridges []string
-	CPUCap         int
-	MemoryCapMB    int
-	DiskCapGB      int
-	SafetyMemoryMB int
-	WriteEnabled   bool
-	RuntimeGroup   string
+	LibvirtURI        string
+	VirshPath         string
+	QemuImgPath       string
+	SeedToolPath      string
+	PingPath          string
+	ArpingPath        string
+	CacheRoot         string
+	ImageAllowedHosts []string
+	ImagePrivateHosts []string
+	ImageMaxBytes     int64
+	CacheMaxBytes     int64
+	SafetyDiskGB      int
+	StorageRoot       string
+	ImageRoot         string
+	AllowedBridges    []string
+	CPUCap            int
+	MemoryCapMB       int
+	DiskCapGB         int
+	SafetyMemoryMB    int
+	WriteEnabled      bool
+	RuntimeGroup      string
 }
 
 type Runner interface {
@@ -44,18 +58,49 @@ type CommandRunner struct{}
 
 func (CommandRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
-	output, err := cmd.CombinedOutput()
+	output := &boundedCommandOutput{}
+	cmd.Stdout, cmd.Stderr = output, output
+	err := cmd.Run()
 	if err != nil {
-		return nil, fmt.Errorf("%s failed: %w: %s", filepath.Base(name), err, strings.TrimSpace(string(output)))
+		return nil, fmt.Errorf("%s failed: %w: %s", filepath.Base(name), err, strings.TrimSpace(output.String()))
 	}
-	return output, nil
+	if output.truncated {
+		return nil, errors.New("工具输出超过安全上限")
+	}
+	return output.Bytes(), nil
+}
+
+type boundedCommandOutput struct {
+	bytes.Buffer
+	truncated bool
+}
+
+func (output *boundedCommandOutput) Write(data []byte) (int, error) {
+	size := len(data)
+	remaining := (1 << 20) - output.Len()
+	if remaining < len(data) {
+		data = data[:remaining]
+		output.truncated = true
+	}
+	_, _ = output.Buffer.Write(data)
+	return size, nil
 }
 
 type Driver struct {
-	config     Config
-	runner     Runner
-	files      FileSystem
-	runtimeGID int
+	config              Config
+	runner              Runner
+	files               FileSystem
+	runtimeGID          int
+	catalogMu           sync.RWMutex
+	catalog             agentmodel.Catalog
+	catalogLoaded       bool
+	cacheMu             sync.Mutex
+	imageClientOverride *http.Client
+	sshProbe            func(context.Context, string) bool
+	// 仅供隔离测试注入网络实现，不从配置或任务接受此类回调。
+	imageLookup  func(context.Context, string) ([]net.IPAddr, error)
+	imageDial    func(context.Context, string, string) (net.Conn, error)
+	imageRootCAs *x509.CertPool
 }
 
 func New(config Config, runner Runner) (*Driver, error) {
@@ -74,16 +119,45 @@ func New(config Config, runner Runner) (*Driver, error) {
 	if config.PingPath == "" {
 		config.PingPath = "/usr/bin/ping"
 	}
-	if config.SafetyMemoryMB < 0 || config.CPUCap < 0 || config.MemoryCapMB < 0 || config.DiskCapGB < 0 {
+	if config.ArpingPath == "" {
+		config.ArpingPath = "/usr/bin/arping"
+	}
+	if config.CacheRoot == "" {
+		config.CacheRoot = filepath.Join(config.ImageRoot, ".vmp-cache")
+	}
+	if config.ImageMaxBytes == 0 {
+		config.ImageMaxBytes = 10 << 30
+	}
+	if config.CacheMaxBytes == 0 {
+		config.CacheMaxBytes = 40 << 30
+	}
+	if config.ImageMaxBytes < 1 || config.CacheMaxBytes < config.ImageMaxBytes {
+		return nil, errors.New("镜像及缓存容量限制无效")
+	}
+	for index, host := range config.ImageAllowedHosts {
+		config.ImageAllowedHosts[index] = strings.ToLower(strings.TrimSpace(host))
+	}
+	for index, host := range config.ImagePrivateHosts {
+		config.ImagePrivateHosts[index] = strings.ToLower(strings.TrimSpace(host))
+		if !slices.Contains(config.ImageAllowedHosts, config.ImagePrivateHosts[index]) {
+			return nil, errors.New("私网镜像域名必须同时位于 HTTPS 域名白名单")
+		}
+	}
+	if config.SafetyMemoryMB < 0 || config.SafetyDiskGB < 0 || config.CPUCap < 0 || config.MemoryCapMB < 0 || config.DiskCapGB < 0 {
 		return nil, errors.New("resource caps and safety memory must not be negative")
 	}
-	for _, root := range []string{config.StorageRoot, config.ImageRoot} {
+	for _, root := range []string{config.StorageRoot, config.ImageRoot, config.CacheRoot} {
 		if !filepath.IsAbs(root) || filepath.Clean(root) == "/" {
 			return nil, fmt.Errorf("unsafe root path %q", root)
 		}
 	}
 	if len(config.AllowedBridges) == 0 {
 		return nil, errors.New("at least one allowed bridge is required")
+	}
+	for _, bridge := range config.AllowedBridges {
+		if !namePattern.MatchString(bridge) {
+			return nil, errors.New("网桥白名单名称无效")
+		}
 	}
 	if runner == nil {
 		runner = CommandRunner{}
@@ -122,6 +196,8 @@ func (d *Driver) Execute(ctx context.Context, task agentmodel.Task) (agentmodel.
 		return d.executePowerAction(ctx, task)
 	case "RESET_INSTANCE_PASSWORD":
 		return d.executeResetPassword(ctx, task)
+	case "SYNC_IMAGE":
+		return d.executeSyncImage(ctx, task)
 	default:
 		return agentmodel.TaskResult{}, fmt.Errorf("unsupported KVM task type %q", task.Type)
 	}
@@ -138,6 +214,7 @@ func (d *Driver) Inspect(ctx context.Context) (agentmodel.Snapshot, error) {
 			status = "DEGRADED"
 		}
 	}
+	resourceMeasuredAt := time.Now().UTC()
 	totalMemoryMB, availableMemoryMB, memErr := readMemoryInfo("/proc/meminfo")
 	if memErr != nil {
 		checks = append(checks, agentmodel.Check{Name: "memory", OK: false, Message: memErr.Error()})
@@ -155,25 +232,84 @@ func (d *Driver) Inspect(ctx context.Context) (agentmodel.Snapshot, error) {
 		status = "DEGRADED"
 	}
 	hostname, _ := os.Hostname()
-	allocatableMemory := max(0, availableMemoryMB-d.config.SafetyMemoryMB)
-	allocatableCPU := runtime.NumCPU()
-	allocatableDisk := storageFreeGB
-	if d.config.MemoryCapMB > 0 {
-		allocatableMemory = min(allocatableMemory, d.config.MemoryCapMB)
+	totalDisk, diskErr := totalDiskGB(d.config.StorageRoot)
+	if diskErr != nil {
+		status = "DEGRADED"
+		checks = append(checks, agentmodel.Check{Name: "storage-budget", OK: false, Message: diskErr.Error()})
 	}
-	if d.config.CPUCap > 0 {
-		allocatableCPU = min(allocatableCPU, d.config.CPUCap)
-	}
-	if d.config.DiskCapGB > 0 {
-		allocatableDisk = min(allocatableDisk, d.config.DiskCapGB)
-	}
+	allocatableCPU, allocatableMemory, allocatableDisk := resourceBudgets(d.config, runtime.NumCPU(), totalMemoryMB, totalDisk)
 	facts := agentmodel.HostFacts{Hostname: hostname, Architecture: runtime.GOARCH, KernelVersion: kernelVersion(), LibvirtURI: d.config.LibvirtURI, LibvirtVersion: libvirtVersion, HypervisorVersion: hypervisorVersion, StorageRoot: d.config.StorageRoot, ImageRoot: d.config.ImageRoot, Bridges: append([]string(nil), d.config.AllowedBridges...), TotalMemoryMB: totalMemoryMB, AvailableMemoryMB: availableMemoryMB, StorageFreeGB: storageFreeGB}
+	facts.BudgetSource = "CONFIGURED_TOTAL"
+	facts.ResourceMeasuredAt = resourceMeasuredAt
+	facts.SafeAvailableMemoryMB = max(0, availableMemoryMB-d.config.SafetyMemoryMB)
+	facts.SafeAvailableDiskGB = max(0, storageFreeGB-d.config.SafetyDiskGB)
+	var imagesComplete bool
+	facts.Images, imagesComplete = d.inspectImages(ctx)
+	facts.Networks = d.networkReadiness()
+	for index := range domains {
+		if !agentmodel.IsPreflight(ctx) && domains[index].Ownership == "MANAGED" && domains[index].State == "RUNNING" {
+			d.inspectDelivery(ctx, &domains[index])
+		}
+	}
+	d.catalogMu.RLock()
+	facts.ReadinessComplete = d.catalogLoaded && ctx.Err() == nil && imagesComplete
+	d.catalogMu.RUnlock()
 	return agentmodel.Snapshot{Status: status, AllocatableCPU: allocatableCPU, AllocatableMemoryMB: allocatableMemory, AllocatableDiskGB: allocatableDisk, Facts: facts, Domains: domains, InventoryComplete: domainErr == nil, Checks: checks}, nil
+}
+
+func resourceBudgets(config Config, cpu, totalMemory, totalDisk int) (int, int, int) {
+	memory, disk := max(0, totalMemory-config.SafetyMemoryMB), max(0, totalDisk-config.SafetyDiskGB)
+	if config.CPUCap > 0 {
+		cpu = min(cpu, config.CPUCap)
+	}
+	if config.MemoryCapMB > 0 {
+		memory = min(memory, config.MemoryCapMB)
+	}
+	if config.DiskCapGB > 0 {
+		disk = min(disk, config.DiskCapGB)
+	}
+	return cpu, memory, disk
+}
+
+func (d *Driver) UpdateCatalog(catalog agentmodel.Catalog) {
+	d.catalogMu.Lock()
+	d.catalog = catalog
+	d.catalogLoaded = true
+	d.catalogMu.Unlock()
+}
+func (d *Driver) currentCatalog() agentmodel.Catalog {
+	d.catalogMu.RLock()
+	defer d.catalogMu.RUnlock()
+	return d.catalog
+}
+
+func totalDiskGB(path string) (int, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0, err
+	}
+	return int(stat.Blocks * uint64(stat.Bsize) / (1 << 30)), nil
+}
+
+func (d *Driver) networkReadiness() []agentmodel.NetworkReadiness {
+	networks := make([]agentmodel.NetworkReadiness, 0, len(d.config.AllowedBridges))
+	for _, bridge := range d.config.AllowedBridges {
+		_, err := os.Stat(filepath.Join("/sys/class/net", bridge, "bridge"))
+		iface, linkErr := net.InterfaceByName(bridge)
+		item := agentmodel.NetworkReadiness{Bridge: bridge, Ready: err == nil && linkErr == nil && iface.Flags&net.FlagUp != 0}
+		if err != nil {
+			item.Error = "网桥未在宿主存在"
+		} else if !item.Ready {
+			item.Error = "网桥未处于启用状态"
+		}
+		networks = append(networks, item)
+	}
+	return networks
 }
 
 func (d *Driver) preflight(ctx context.Context) []agentmodel.Check {
 	checks := make([]agentmodel.Check, 0, 7+len(d.config.AllowedBridges))
-	for name, path := range map[string]string{"virsh": d.config.VirshPath, "qemu-img": d.config.QemuImgPath, "seed-tool": d.config.SeedToolPath, "ping": d.config.PingPath} {
+	for name, path := range map[string]string{"virsh": d.config.VirshPath, "qemu-img": d.config.QemuImgPath, "seed-tool": d.config.SeedToolPath, "ping": d.config.PingPath, "arping": d.config.ArpingPath} {
 		info, err := os.Stat(path)
 		checks = append(checks, agentmodel.Check{Name: name, OK: err == nil && !info.IsDir(), Message: checkMessage(path, err)})
 	}

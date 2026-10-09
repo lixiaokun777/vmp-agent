@@ -2,6 +2,7 @@ package kvm
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -24,22 +25,25 @@ var (
 // CreateSpec 是生成 KVM 交付计划所需的完整、可验证输入。
 // 密码只接受已加密的 cloud-init 密码摘要，不接受明文密码。
 type CreateSpec struct {
-	InstanceID    string
-	Name          string
-	CPU           int
-	MemoryMB      int
-	DiskGB        int
-	ImageFile     string
-	ImagePath     string
-	Bridge        string
-	MACAddress    string
-	IPAddress     string
-	PrefixLength  int
-	Gateway       string
-	DNSServers    []string
-	Username      string
-	PasswordHash  string
-	SSHAuthorized string
+	InstanceID      string
+	Name            string
+	CPU             int
+	MemoryMB        int
+	DiskGB          int
+	ImageFile       string
+	ImagePath       string
+	ImageID         string
+	ImageChecksum   string
+	ImageGeneration int64
+	Bridge          string
+	MACAddress      string
+	IPAddress       string
+	PrefixLength    int
+	Gateway         string
+	DNSServers      []string
+	Username        string
+	PasswordHash    string
+	SSHAuthorized   string
 }
 
 // ProvisionPlan 只包含将来执行所需的路径和文本产物，本身不会写入磁盘或调用 libvirt。
@@ -114,6 +118,17 @@ func (d *Driver) resolveBaseImagePath(spec CreateSpec) (string, error) {
 }
 
 func (d *Driver) validateCreateSpec(spec CreateSpec) error {
+	if spec.ImageChecksum != "" {
+		if len(spec.ImageChecksum) != 64 {
+			return errors.New("镜像 SHA-256 摘要长度无效")
+		}
+		if _, err := hex.DecodeString(spec.ImageChecksum); err != nil {
+			return errors.New("镜像 SHA-256 摘要格式无效")
+		}
+	}
+	if len(spec.ImageID) > 128 || spec.ImageGeneration < 0 {
+		return errors.New("镜像标识或版本无效")
+	}
 	if !instanceIDPattern.MatchString(spec.InstanceID) {
 		return errors.New("invalid instance id")
 	}

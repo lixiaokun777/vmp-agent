@@ -1,6 +1,6 @@
 # VMP Agent
 
-[GitHub Releases](https://github.com/lixiaokun777/vmp-agent/releases) · [部署与运维](docs/部署与运维.md)
+[0.5.0 发布](https://github.com/lixiaokun777/vmp-agent/releases/tag/v0.5.0) · [部署与运维](docs/部署与运维.md)
 
 VMP Agent 运行在 KVM 宿主机上，负责宿主机预检、资源上报、存量虚拟机发现和平台任务执行。真实 KVM 驱动默认只读，只有显式打开三重写模式门禁后才执行写操作。
 
@@ -8,7 +8,7 @@ VMP Agent 运行在 KVM 宿主机上，负责宿主机预检、资源上报、�
 
 - `mock`：本地和联调环境使用的模拟驱动。
 - `kvm-readonly`：真实 KVM/libvirt 宿主机的只读纳管模式。
-- `kvm`：执行创建、删除、电源控制和基于 QEMU Guest Agent 的系统密码重置。
+- `kvm`：执行创建、删除、电源控制、系统密码重置和镜像同步。
 
 Agent 不依赖 systemd。发布包携带 `control.sh`，支持预检、启动、停止、重启、状态查询和日志跟踪。
 
@@ -22,20 +22,32 @@ Agent 不依赖 systemd。发布包携带 `control.sh`，支持预检、启动�
 
 回滚必须确认托管域已停止并取消定义后才能删除磁盘。无法确认时保留磁盘、清单和补偿标记，下次创建重试先完成安全补偿；不会因 libvirt 临时断连误删运行中的系统盘。重启任务在执行中崩溃时不盲目重放，会报告“执行结果不确定”，需要核查后重新发起。
 
-Agent 可选启用 VNC/串口 WebSocket 代理。VNC 始终由 libvirt 监听在 `127.0.0.1`，浏览器只能使用控制面签发的 5 分钟一次性票据访问代理；Agent 在连接前向控制面原子核销票据，新建实例默认带 PTY 串口设备。
+Agent 可选启用 VNC/串口 WebSocket 代理。VNC 始终由 libvirt 监听在 `127.0.0.1`；浏览器连接平台同源控制台入口，由控制面代理到 Agent。Agent `19090` 只应允许控制节点访问，不能对所有用户网段或公网开放。Agent 在连接前核销 5 分钟一次性票据，新建实例默认带 PTY 串口设备。
+
+## 资源、镜像与交付
+
+- `allocatable_*` 是固定总预算，和实际 `safe_available_*` 分开上报；`resource_measured_at` 标识真实读数时间，重复心跳不能把旧读数当成新容量。
+- 从控制面获取镜像/网络清单，逐宿主上报镜像版本、SHA-256 和网桥就绪；调度不能只看宿主总资源，还必须匹配已就绪镜像/网络。
+- `SYNC_IMAGE` 真实下载远程/OSS HTTPS 镜像，严格域名白名单，默认阻止私网、loopback、link-local、DNS 重绑定和重定向。私有 OSS 需要额外显式私网白名单，TLS 证书照常验证。
+- 本地镜像通过根目录句柄打开，复制已打开文件到 `.vmp-cache/<sha256>/<file_name>` 的只读不可变缓存，避免中间 symlink 与检查后路径替换；不能覆盖在用 backing。
+- 创建前 ARP DAD 与 ICMP 联合探测冲突。启动后分别核验 Guest Agent 的 IP/MAC、cloud-init 完成和 SSH 可达；未就绪保留运行域、磁盘与原 IP，返回中文交付状态，不因 ping 失败删除虚机。
+
+详细的协议、限制、缓存回收与排障见 [镜像与交付安全](docs/镜像与交付安全.md)。
 
 ## 构建
+
+源码最低要求 Go 1.24（使用 `os.OpenRoot`），正式发布固定 Go 1.27.2，并运行 race、vet 和漏洞检查。
 
 ```bash
 go test ./...
 ./scripts/build-agent-bundle.sh
 ```
 
-产物默认为 `dist/vmlease-agent-linux-amd64.tar.gz`。
+产物包含 `dist/vmlease-agent-linux-amd64.tar.gz`、`dist/vmlease-agent-linux-arm64.tar.gz` 和 `dist/SHA256SUMS`；安装包携带中文文档。使用匹配架构的包并校验摘要。
 
 ## 部署
 
-Ubuntu KVM 宿主机需要提前安装 `libvirt-clients`、`qemu-utils`、`cloud-image-utils` 或 `genisoimage`，并准备独立的实例目录、基础镜像目录和 Linux bridge。
+Ubuntu KVM 宿主机需要提前安装 `libvirt-clients`、`qemu-utils`、`iputils-arping`、`iputils-ping`、`cloud-image-utils` 或 `genisoimage`，并准备独立实例目录、基础镜像、缓存目录和 Linux bridge。ARP DAD 需要 `CAP_NET_RAW`；非 root 运行时按部署文档配置工具权限。
 
 ```bash
 tar -xzf vmlease-agent-linux-amd64.tar.gz
@@ -56,7 +68,7 @@ chmod 600 conf/agent.env
 - 未携带合法平台元数据的虚拟机均视为外部资源。
 - 密码重置任务只接收加密摘要，不接收或记录明文密码。
 - 支持密码重置的 Linux 镜像必须预装 `qemu-guest-agent`。
-- 控制台代理必须配置独立长随机签名密钥和精确的平台 Origin，宿主机防火墙只向平台用户网段开放代理端口。
+- 控制台代理必须配置独立长随机签名密钥和精确的平台 Origin，宿主机防火墙只向控制节点开放 Agent 代理端口。
 - 升级和回滚必须保留 `AGENT_STATE_DIR`；其凭据、领取令牌、密码摘要日志不得上传到公开仓库或普通诊断附件。
 
 ## 旧版升级注意事项

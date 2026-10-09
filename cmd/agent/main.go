@@ -109,13 +109,14 @@ func buildDriver() (agentmodel.Driver, error) {
 		if writeEnabled && (env("KVM_WRITE_ENABLED", "false") != "true" || env("KVM_WRITE_CONFIRMATION", "") != "enable-kvm-write") {
 			return nil, errors.New("KVM write mode requires KVM_WRITE_ENABLED=true and KVM_WRITE_CONFIRMATION=enable-kvm-write")
 		}
-		return kvm.New(kvm.Config{LibvirtURI: env("KVM_LIBVIRT_URI", "qemu:///system"), VirshPath: env("KVM_VIRSH_PATH", "/usr/bin/virsh"), QemuImgPath: env("KVM_QEMU_IMG_PATH", "/usr/bin/qemu-img"), SeedToolPath: env("KVM_SEED_TOOL_PATH", "/usr/bin/cloud-localds"), PingPath: env("KVM_PING_PATH", "/usr/bin/ping"), StorageRoot: env("KVM_STORAGE_ROOT", "/data/kvm-images/ephemeral"), ImageRoot: env("KVM_IMAGE_ROOT", "/data/cloud-init/images"), AllowedBridges: splitCSV(env("KVM_ALLOWED_BRIDGES", "br0")), CPUCap: envInt("ALLOCATABLE_CPU", 0), MemoryCapMB: envInt("ALLOCATABLE_MEMORY_MB", 40960), DiskCapGB: envInt("ALLOCATABLE_DISK_GB", 0), SafetyMemoryMB: envInt("KVM_SAFETY_MEMORY_MB", 10240), WriteEnabled: writeEnabled, RuntimeGroup: env("KVM_RUNTIME_GROUP", "kvm")}, nil)
+		return kvm.New(kvm.Config{LibvirtURI: env("KVM_LIBVIRT_URI", "qemu:///system"), VirshPath: env("KVM_VIRSH_PATH", "/usr/bin/virsh"), QemuImgPath: env("KVM_QEMU_IMG_PATH", "/usr/bin/qemu-img"), SeedToolPath: env("KVM_SEED_TOOL_PATH", "/usr/bin/cloud-localds"), PingPath: env("KVM_PING_PATH", "/usr/bin/ping"), ArpingPath: env("KVM_ARPING_PATH", "/usr/bin/arping"), CacheRoot: os.Getenv("KVM_CACHE_ROOT"), ImageAllowedHosts: splitCSV(os.Getenv("KVM_IMAGE_ALLOWED_HOSTS")), ImagePrivateHosts: splitCSV(os.Getenv("KVM_IMAGE_PRIVATE_HOSTS")), ImageMaxBytes: int64(envInt("KVM_IMAGE_MAX_GB", 10)) << 30, CacheMaxBytes: int64(envInt("KVM_IMAGE_CACHE_MAX_GB", 40)) << 30, SafetyDiskGB: envInt("KVM_SAFETY_DISK_GB", 10), StorageRoot: env("KVM_STORAGE_ROOT", "/data/kvm-images/ephemeral"), ImageRoot: env("KVM_IMAGE_ROOT", "/data/cloud-init/images"), AllowedBridges: splitCSV(env("KVM_ALLOWED_BRIDGES", "br0")), CPUCap: envInt("ALLOCATABLE_CPU", 0), MemoryCapMB: envInt("ALLOCATABLE_MEMORY_MB", 40960), DiskCapGB: envInt("ALLOCATABLE_DISK_GB", 0), SafetyMemoryMB: envInt("KVM_SAFETY_MEMORY_MB", 10240), WriteEnabled: writeEnabled, RuntimeGroup: env("KVM_RUNTIME_GROUP", "kvm")}, nil)
 	default:
 		return nil, fmt.Errorf("unsupported AGENT_MODE %q; allowed values are mock, kvm-readonly and kvm", mode)
 	}
 }
 
 func runPreflight(ctx context.Context, driver agentmodel.Driver) {
+	ctx = agentmodel.PreflightContext(ctx)
 	snapshot, err := driver.Inspect(ctx)
 	if err != nil {
 		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"status": "ERROR", "error": err.Error()})
@@ -130,6 +131,13 @@ func runPreflight(ctx context.Context, driver agentmodel.Driver) {
 }
 
 func (a *Agent) refreshInventory(ctx context.Context) error {
+	if driver, ok := a.Driver.(agentmodel.CatalogDriver); ok && a.HostID != "" {
+		var catalog agentmodel.Catalog
+		if err := a.request(ctx, "GET", "/api/v1/agents/"+a.HostID+"/catalog", nil, &catalog, "Authorization", "Bearer "+a.RuntimeToken); err != nil {
+			return err
+		}
+		driver.UpdateCatalog(catalog)
+	}
 	snapshot, err := a.Driver.Inspect(ctx)
 	if err != nil {
 		return err

@@ -57,17 +57,24 @@ func (a *Agent) run(ctx context.Context, intervals workerIntervals) {
 			defer workers.Done()
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
+			operation := func() {
+				operationCtx, cancel := context.WithTimeout(ctx, timeout)
+				err := action(operationCtx)
+				cancel()
+				if err != nil && ctx.Err() == nil {
+					slog.Warn(name, "error", err)
+				}
+			}
+			// 注册后立即启动独立检查，不等待一分钟才报告镜像/网桥矩阵。
+			if ctx.Err() == nil {
+				operation()
+			}
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					operationCtx, cancel := context.WithTimeout(ctx, timeout)
-					err := action(operationCtx)
-					cancel()
-					if err != nil && ctx.Err() == nil {
-						slog.Warn(name, "error", err)
-					}
+					operation()
 				}
 			}
 		}()
@@ -186,7 +193,9 @@ func (a *Agent) executeTask(ctx context.Context, record taskRecord) error {
 	slog.Info("执行托管任务", "task_id", record.Task.ID, "type", record.Task.Type)
 	result, executeErr := a.Driver.Execute(executeCtx, record.Task)
 	if executeErr != nil {
-		result = taskFailureResult(executeErr)
+		failure := taskFailureResult(executeErr)
+		failure.ImageID, failure.Checksum, failure.FileName, failure.ImageGeneration = result.ImageID, result.Checksum, result.FileName, result.ImageGeneration
+		result = failure
 		if record.Task.Type == "REBOOT_INSTANCE" {
 			// 命令报错也可能发生在副作用之后，禁止控制面通用重试再次重启。
 			result.ErrorCode = "EXECUTION_UNCERTAIN"
@@ -203,6 +212,23 @@ func (a *Agent) executeTask(ctx context.Context, record taskRecord) error {
 }
 
 func (a *Agent) finishTask(ctx context.Context, record taskRecord) error {
+	if record.Task.Type == "SYNC_IMAGE" && record.Result.Success {
+		a.snapshotMu.Lock()
+		images := append([]agentmodel.ImageReadiness(nil), a.Snapshot.Facts.Images...)
+		entry := agentmodel.ImageReadiness{ImageID: record.Result.ImageID, FileName: record.Result.FileName, Checksum: record.Result.Checksum, Generation: record.Result.ImageGeneration, Status: "READY"}
+		found := false
+		for index := range images {
+			if images[index].ImageID == entry.ImageID {
+				images[index] = entry
+				found = true
+			}
+		}
+		if !found {
+			images = append(images, entry)
+		}
+		a.Snapshot.Facts.Images = images
+		a.snapshotMu.Unlock()
+	}
 	record.Phase = "DONE"
 	record.Result.ClaimToken = record.Task.ClaimToken
 	// fsync 完成后才能上报；中途退出的进程会在下次启动重发同一个结果。

@@ -2,6 +2,7 @@ package kvm
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
@@ -26,6 +27,12 @@ func (r *executorRunner) Run(_ context.Context, name string, args ...string) ([]
 		return nil, errors.New("simulated command failure")
 	}
 	switch {
+	case strings.Contains(command, "guest-file-open"):
+		return []byte(`{"return":1}`), nil
+	case strings.Contains(command, "guest-file-read"):
+		return []byte(`{"return":{"buf-b64":"` + base64.StdEncoding.EncodeToString([]byte(`{"v1":{"errors":[]}}`)) + `","eof":true}}`), nil
+	case strings.Contains(command, "guest-file-close"):
+		return []byte(`{"return":{}}`), nil
 	case strings.HasPrefix(command, "ping "):
 		if r.domainRunning {
 			return []byte("64 bytes from guest\n"), nil

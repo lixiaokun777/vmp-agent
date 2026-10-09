@@ -75,6 +75,9 @@ type createTaskPayload struct {
 	DiskGB           int      `json:"disk_gb"`
 	ImageFile        string   `json:"image_file"`
 	ImagePath        string   `json:"image_path"`
+	ImageID          string   `json:"image_id"`
+	ImageChecksum    string   `json:"image_checksum"`
+	ImageGeneration  int64    `json:"image_generation"`
 	Bridge           string   `json:"bridge"`
 	MACAddress       string   `json:"mac_address"`
 	IPAddress        string   `json:"ip_address"`
@@ -104,9 +107,12 @@ type resetPasswordTaskPayload struct {
 }
 
 type instanceManifest struct {
-	Version    int    `json:"version"`
-	InstanceID string `json:"instance_id"`
-	Name       string `json:"name"`
+	Version       int    `json:"version"`
+	InstanceID    string `json:"instance_id"`
+	Name          string `json:"name"`
+	IPAddress     string `json:"ip_address,omitempty"`
+	MACAddress    string `json:"mac_address,omitempty"`
+	BaseImagePath string `json:"base_image_path,omitempty"`
 }
 
 func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (result agentmodel.TaskResult, err error) {
@@ -117,6 +123,7 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 	spec := CreateSpec{
 		InstanceID: payload.InstanceID, Name: payload.Name, CPU: payload.CPU, MemoryMB: payload.MemoryMB,
 		DiskGB: payload.DiskGB, ImageFile: payload.ImageFile, ImagePath: payload.ImagePath, Bridge: payload.Bridge, MACAddress: payload.MACAddress,
+		ImageID: payload.ImageID, ImageChecksum: payload.ImageChecksum, ImageGeneration: payload.ImageGeneration,
 		IPAddress: payload.IPAddress, PrefixLength: payload.PrefixLength, Gateway: payload.Gateway,
 		DNSServers: payload.DNSServers, Username: payload.Username, PasswordHash: payload.PasswordHash,
 		SSHAuthorized: payload.SSHAuthorizedKey,
@@ -156,16 +163,20 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 		default:
 			return result, errors.New("existing managed domain is not in a restartable state")
 		}
-		if err := d.waitForIPAddress(ctx, spec.IPAddress, 90*time.Second); err != nil {
-			return result, err
-		}
-		return agentmodel.TaskResult{Success: true, ProviderRef: existing.ProviderUUID, IPAddress: spec.IPAddress}, nil
+		return d.deliveryResult(ctx, spec, existing.ProviderUUID), nil
 	}
-	if err := d.ensureIPAddressAvailable(ctx, spec.IPAddress); err != nil {
+	if err := d.ensureIPAddressAvailable(ctx, spec.IPAddress, spec.Bridge); err != nil {
 		return result, err
 	}
 
-	if err := d.validateBaseImage(plan.BaseImagePath); err != nil {
+	plan.BaseImagePath, err = d.provisionImage(ctx, spec, plan.BaseImagePath)
+	if err != nil {
+		return result, err
+	}
+	d.cacheMu.Lock()
+	err = d.pinImage(plan.BaseImagePath)
+	d.cacheMu.Unlock()
+	if err != nil {
 		return result, err
 	}
 	if _, statErr := d.files.Lstat(plan.InstanceDir); statErr == nil {
@@ -195,7 +206,7 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 		return result, err
 	}
 
-	manifestData, err := json.MarshalIndent(instanceManifest{Version: 1, InstanceID: spec.InstanceID, Name: spec.Name}, "", "  ")
+	manifestData, err := json.MarshalIndent(instanceManifest{Version: 1, InstanceID: spec.InstanceID, Name: spec.Name, IPAddress: spec.IPAddress, MACAddress: spec.MACAddress, BaseImagePath: plan.BaseImagePath}, "", "  ")
 	if err != nil {
 		return result, err
 	}
@@ -237,10 +248,7 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 	if _, err := d.virshWrite(ctx, "start", spec.Name); err != nil {
 		return result, err
 	}
-	if err := d.waitForIPAddress(ctx, spec.IPAddress, 90*time.Second); err != nil {
-		return result, err
-	}
-	return agentmodel.TaskResult{Success: true, ProviderRef: spec.InstanceID, IPAddress: spec.IPAddress}, nil
+	return d.deliveryResult(ctx, spec, spec.InstanceID), nil
 }
 
 // rollbackCreate 先记录补偿标记，再确认托管域已消失；任何不确定情况都禁止删盘。
@@ -325,7 +333,15 @@ func (d *Driver) resumeCreateRollback(ctx context.Context, spec CreateSpec, plan
 	return nil
 }
 
-func (d *Driver) ensureIPAddressAvailable(ctx context.Context, address string) error {
+func (d *Driver) ensureIPAddressAvailable(ctx context.Context, address, bridge string) error {
+	_, arpErr := d.runner.Run(ctx, d.config.ArpingPath, "-D", "-I", bridge, "-c", "2", "-w", "2", address)
+	if arpErr != nil {
+		var exitCoder interface{ ExitCode() int }
+		if errors.As(arpErr, &exitCoder) && exitCoder.ExitCode() == 1 {
+			return fmt.Errorf("%w：ARP 检测到地址冲突", ErrIPAddressInUse)
+		}
+		return errors.New("ARP 冲突探测失败，拒绝在未验证地址上创建虚机")
+	}
 	output, err := d.runner.Run(ctx, d.config.PingPath, "-c", "1", "-W", "1", address)
 	if err == nil {
 		return fmt.Errorf("%w: %s: %s", ErrIPAddressInUse, address, strings.TrimSpace(string(output)))
@@ -507,6 +523,12 @@ func (d *Driver) executeResetPassword(ctx context.Context, task agentmodel.Task)
 	if normalizeState(string(stateOutput)) != "RUNNING" {
 		return agentmodel.TaskResult{}, errors.New("password can only be reset while the domain is running")
 	}
+	if manifestData, readErr := d.files.ReadFile(filepath.Join(instanceDir, "manifest.json")); readErr == nil {
+		var manifest instanceManifest
+		if json.Unmarshal(manifestData, &manifest) == nil && manifest.IPAddress != "" && !d.cloudInitComplete(ctx, domain.ProviderUUID) {
+			return agentmodel.TaskResult{}, errors.New("cloud-init 尚未完成，不能重置可能被初始交付覆盖的密码；请先使用控制台检查")
+		}
+	}
 	command, err := json.Marshal(map[string]any{
 		"execute": "guest-set-user-password",
 		"arguments": map[string]any{
@@ -574,13 +596,21 @@ func (d *Driver) baseImageFormat(ctx context.Context, path string) (string, erro
 		return "", err
 	}
 	var info struct {
-		Format string `json:"format"`
+		Format         string `json:"format"`
+		Backing        string `json:"backing-filename"`
+		DataFile       string `json:"data-file"`
+		FormatSpecific struct {
+			Data map[string]any `json:"data"`
+		} `json:"format-specific"`
 	}
 	if err := json.Unmarshal(output, &info); err != nil {
 		return "", fmt.Errorf("parse base image information: %w", err)
 	}
 	if info.Format != "qcow2" && info.Format != "raw" {
 		return "", fmt.Errorf("unsupported base image format %q", info.Format)
+	}
+	if info.Backing != "" || info.DataFile != "" || info.FormatSpecific.Data["data-file"] != nil {
+		return "", errors.New("基础镜像不能引用外部 backing 或 data 文件")
 	}
 	return info.Format, nil
 }
