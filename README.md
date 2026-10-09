@@ -1,6 +1,8 @@
 # VMP Agent
 
-[0.5.1 发布](https://github.com/lixiaokun777/vmp-agent/releases/tag/v0.5.1) · [部署与运维](docs/部署与运维.md)
+[0.5.2 发布](https://github.com/lixiaokun777/vmp-agent/releases/tag/v0.5.2) · [部署与运维](docs/部署与运维.md)
+
+`0.5.2` 增加 `AGENT_MANAGEMENT_IP`，明确上报控制节点可达的宿主管理 IP，修复升级/重启后控制台管理地址丢失。推荐后端/Agent `0.5.2` 与前端 `0.5.1`，原独立凭据和状态目录保持不变。
 
 VMP Agent 运行在 KVM 宿主机上，负责宿主机预检、资源上报、存量虚拟机发现和平台任务执行。真实 KVM 驱动默认只读，只有显式打开三重写模式门禁后才执行写操作。
 

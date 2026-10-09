@@ -333,6 +333,10 @@ func TestLongTaskDoesNotBlockHeartbeatOrInventory(t *testing.T) {
 func TestRegisterPersistsScopedCredentialAndDoesNotOverwriteOnResume(t *testing.T) {
 	var registering atomic.Int32
 	a, _ := testWorkerAgent(t, func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload["management_ip"] != "10.200.8.172" {
+			t.Errorf("首次和恢复注册均须发送显式管理 IP：%#v, %v", payload, err)
+		}
 		if registering.Add(1) == 1 {
 			if r.Header.Get("X-Bootstrap-Token") != "bootstrap" {
 				t.Error("首次未使用引导令牌")
@@ -347,6 +351,7 @@ func TestRegisterPersistsScopedCredentialAndDoesNotOverwriteOnResume(t *testing.
 	})
 	a.HostID = ""
 	a.BootstrapToken = "bootstrap"
+	a.ManagementIP = "10.200.8.172"
 	if err := a.register(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -356,5 +361,61 @@ func TestRegisterPersistsScopedCredentialAndDoesNotOverwriteOnResume(t *testing.
 	var saved credentials
 	if err := a.State.read("credentials.json", &saved); err != nil || saved.RuntimeToken != strings.Repeat("s", 48) {
 		t.Fatal("恢复注册清空已保存凭据")
+	}
+}
+
+func TestRegisterManagementIPPayload(t *testing.T) {
+	for _, tc := range []struct {
+		name, value, want string
+	}{
+		{name: "IPv4", value: "10.200.8.172", want: "10.200.8.172"},
+		{name: "IPv6", value: "2001:db8::172", want: "2001:db8::172"},
+		{name: "留空不覆盖"},
+		{name: "空白不覆盖", value: " \t "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			a, _ := testWorkerAgent(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.URL.Path != "/api/v1/agents/register" || r.Method != http.MethodPost {
+					t.Errorf("注册请求不正确：%s %s", r.Method, r.URL.Path)
+				}
+				var payload map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Error(err)
+				}
+				value, sent := payload["management_ip"]
+				if tc.want == "" && sent {
+					t.Errorf("留空时不能发送 management_ip：%#v", value)
+				} else if tc.want != "" && (!sent || value != tc.want) {
+					t.Errorf("管理 IP = %#v，期望 %q", value, tc.want)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]string{"id": "host-1"})
+			})
+			a.ManagementIP = tc.value
+			// 即使配置了控制台 URL，也不能从中猜测未配置的管理 IP。
+			a.ConsolePublicURL = "ws://10.200.8.172:19090"
+			if err := a.register(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if calls.Load() != 1 {
+				t.Fatal("没有发送预期的注册请求")
+			}
+		})
+	}
+}
+
+func TestRegisterRejectsInvalidManagementIPBeforeRequest(t *testing.T) {
+	var calls atomic.Int32
+	a, _ := testWorkerAgent(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]string{"id": "host-1"})
+	})
+	a.ManagementIP = "10.200.8.172:19090"
+	if err := a.register(context.Background()); err == nil || !strings.Contains(err.Error(), "AGENT_MANAGEMENT_IP") {
+		t.Fatalf("非法管理 IP 未返回配置错误：%v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("非法管理 IP 不应发出注册请求")
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strconv"
@@ -29,6 +30,7 @@ type Agent struct {
 	Driver                                              agentmodel.Driver
 	Snapshot                                            agentmodel.Snapshot
 	ConsolePublicURL                                    string
+	ManagementIP                                        string
 	State                                               *stateStore
 	snapshotMu                                          sync.RWMutex
 	leaseRenewInterval                                  time.Duration
@@ -37,6 +39,11 @@ type Agent struct {
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	managementIP, err := parseManagementIP(os.Getenv("AGENT_MANAGEMENT_IP"))
+	if err != nil {
+		slog.Error("Agent 宿主管理 IP 配置无效", "error", err)
+		os.Exit(2)
+	}
 	driver, err := buildDriver()
 	if err != nil {
 		slog.Error("invalid agent configuration", "error", err)
@@ -53,6 +60,7 @@ func main() {
 	}
 	defer state.Close()
 	a := &Agent{BaseURL: strings.TrimRight(env("CONTROL_PLANE_URL", "http://localhost:8080"), "/"), BootstrapToken: os.Getenv("AGENT_BOOTSTRAP_TOKEN"), RuntimeToken: os.Getenv("AGENT_RUNTIME_TOKEN"), HostID: os.Getenv("AGENT_HOST_ID"), Name: env("AGENT_NAME", "dev-kvm-simulator"), Client: &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}, Driver: driver, ConsolePublicURL: os.Getenv("CONSOLE_PUBLIC_URL"), State: state}
+	a.ManagementIP = managementIP
 	if err := a.loadCredentials(); err != nil {
 		slog.Error("无法读取宿主机凭据", "error", err)
 		os.Exit(2)
@@ -150,8 +158,16 @@ func (a *Agent) refreshInventory(ctx context.Context) error {
 }
 
 func (a *Agent) register(ctx context.Context) error {
+	managementIP, err := parseManagementIP(a.ManagementIP)
+	if err != nil {
+		return err
+	}
 	snapshot := a.snapshot()
 	body := map[string]any{"name": a.Name, "host_id": a.HostID, "mode": a.Driver.Mode(), "allocatable_cpu": snapshot.AllocatableCPU, "allocatable_memory_mb": snapshot.AllocatableMemoryMB, "allocatable_disk_gb": snapshot.AllocatableDiskGB}
+	// 留空时不发送字段，由控制面保留原地址；不能从请求来源或控制台地址推断。
+	if managementIP != "" {
+		body["management_ip"] = managementIP
+	}
 	var out struct {
 		ID           string `json:"id"`
 		RuntimeToken string `json:"runtime_token"`
@@ -177,6 +193,22 @@ func (a *Agent) register(ctx context.Context) error {
 		return a.State.write("credentials.json", credentials{a.HostID, a.RuntimeToken})
 	}
 	return nil
+}
+
+func parseManagementIP(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	address, err := netip.ParseAddr(value)
+	if err != nil || address.Zone() != "" {
+		return "", errors.New("AGENT_MANAGEMENT_IP 只能填写 IPv4 或 IPv6 地址，不能包含域名、URL、端口、网段或网卡区域")
+	}
+	address = address.Unmap()
+	if address.IsUnspecified() || address.IsMulticast() {
+		return "", errors.New("AGENT_MANAGEMENT_IP 不能使用未指定地址或组播地址")
+	}
+	return address.String(), nil
 }
 
 func (a *Agent) heartbeat(ctx context.Context) error {
