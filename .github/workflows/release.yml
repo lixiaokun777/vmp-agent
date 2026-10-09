@@ -23,7 +23,10 @@ jobs:
           cache: true
 
       - name: 运行测试
-        run: go test ./...
+        run: go test -race -count=1 ./...
+
+      - name: 静态检查
+        run: go vet ./...
 
       - name: 构建安装包
         run: ./scripts/build-agent-bundle.sh

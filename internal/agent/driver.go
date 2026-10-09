@@ -1,6 +1,13 @@
 package agent
 
-import "context"
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// ErrTaskLeaseLost 表示当前执行者已失去所有权，禁止继续变更虚拟机。
+var ErrTaskLeaseLost = errors.New("任务租约已失效，停止执行并等待控制面重新协调")
 
 // Driver 将虚拟化平台的资源发现与任务执行同控制面协议隔离。
 // KVM 是第一个实现；后续接入其他虚拟化驱动时，无需修改 Agent 主循环。
@@ -55,12 +62,15 @@ type Check struct {
 }
 
 type Task struct {
-	ID      string         `json:"id"`
-	Type    string         `json:"type"`
-	Payload map[string]any `json:"payload"`
+	ID         string         `json:"id"`
+	Type       string         `json:"type"`
+	Payload    map[string]any `json:"payload"`
+	ClaimToken string         `json:"claim_token,omitempty"`
+	LeaseUntil time.Time      `json:"lease_until,omitempty"`
 }
 
 type TaskResult struct {
+	ClaimToken  string `json:"claim_token,omitempty"`
 	Success     bool   `json:"success"`
 	ProviderRef string `json:"provider_ref,omitempty"`
 	IPAddress   string `json:"ip_address,omitempty"`

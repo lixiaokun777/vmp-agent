@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,6 +29,9 @@ type Agent struct {
 	Driver                                              agentmodel.Driver
 	Snapshot                                            agentmodel.Snapshot
 	ConsolePublicURL                                    string
+	State                                               *stateStore
+	snapshotMu                                          sync.RWMutex
+	leaseRenewInterval                                  time.Duration
 }
 
 func main() {
@@ -42,8 +46,21 @@ func main() {
 		runPreflight(ctx, driver)
 		return
 	}
-	a := &Agent{BaseURL: env("CONTROL_PLANE_URL", "http://localhost:8080"), BootstrapToken: env("AGENT_BOOTSTRAP_TOKEN", "dev-bootstrap-token"), RuntimeToken: env("AGENT_RUNTIME_TOKEN", "dev-agent-token"), Name: env("AGENT_NAME", "dev-kvm-simulator"), Client: &http.Client{Timeout: 15 * time.Second}, Driver: driver, ConsolePublicURL: os.Getenv("CONSOLE_PUBLIC_URL")}
-	if err := a.refreshInventory(ctx); err != nil {
+	state, err := openStateStore(env("AGENT_STATE_DIR", "/var/lib/vmlease-agent"))
+	if err != nil {
+		slog.Error("无法初始化 Agent 私有状态目录", "error", err)
+		os.Exit(2)
+	}
+	defer state.Close()
+	a := &Agent{BaseURL: strings.TrimRight(env("CONTROL_PLANE_URL", "http://localhost:8080"), "/"), BootstrapToken: os.Getenv("AGENT_BOOTSTRAP_TOKEN"), RuntimeToken: os.Getenv("AGENT_RUNTIME_TOKEN"), HostID: os.Getenv("AGENT_HOST_ID"), Name: env("AGENT_NAME", "dev-kvm-simulator"), Client: &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}, Driver: driver, ConsolePublicURL: os.Getenv("CONSOLE_PUBLIC_URL"), State: state}
+	if err := a.loadCredentials(); err != nil {
+		slog.Error("无法读取宿主机凭据", "error", err)
+		os.Exit(2)
+	}
+	inspectCtx, cancelInspect := context.WithTimeout(ctx, 90*time.Second)
+	err = a.refreshInventory(inspectCtx)
+	cancelInspect()
+	if err != nil {
 		slog.Error("initial host inspection failed", "error", err)
 		os.Exit(2)
 	}
@@ -79,32 +96,7 @@ func main() {
 			}
 		}()
 	}
-	heartbeat := time.NewTicker(10 * time.Second)
-	inventory := time.NewTicker(60 * time.Second)
-	poll := time.NewTicker(2 * time.Second)
-	defer heartbeat.Stop()
-	defer inventory.Stop()
-	defer poll.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-inventory.C:
-			if err := a.refreshInventory(ctx); err != nil {
-				slog.Warn("host inspection failed", "error", err)
-			}
-		case <-heartbeat.C:
-			if err := a.heartbeat(ctx); err != nil {
-				slog.Warn("heartbeat failed", "error", err)
-			}
-		case <-poll.C:
-			if a.Driver.Mode() != "kvm-readonly" {
-				if err := a.poll(ctx); err != nil {
-					slog.Warn("poll failed", "error", err)
-				}
-			}
-		}
-	}
+	a.run(ctx, workerIntervals{Heartbeat: 10 * time.Second, Inventory: 60 * time.Second, Poll: 2 * time.Second})
 }
 
 func buildDriver() (agentmodel.Driver, error) {
@@ -142,40 +134,45 @@ func (a *Agent) refreshInventory(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	snapshot.Facts.ConsoleURL = a.ConsolePublicURL
+	a.snapshotMu.Lock()
 	a.Snapshot = snapshot
-	a.Snapshot.Facts.ConsoleURL = a.ConsolePublicURL
+	a.snapshotMu.Unlock()
 	return nil
 }
 
 func (a *Agent) register(ctx context.Context) error {
-	body := map[string]any{"name": a.Name, "mode": a.Driver.Mode(), "allocatable_cpu": a.Snapshot.AllocatableCPU, "allocatable_memory_mb": a.Snapshot.AllocatableMemoryMB, "allocatable_disk_gb": a.Snapshot.AllocatableDiskGB}
-	var out map[string]any
-	if err := a.request(ctx, "POST", "/api/v1/agents/register", body, &out, "X-Bootstrap-Token", a.BootstrapToken); err != nil {
+	snapshot := a.snapshot()
+	body := map[string]any{"name": a.Name, "host_id": a.HostID, "mode": a.Driver.Mode(), "allocatable_cpu": snapshot.AllocatableCPU, "allocatable_memory_mb": snapshot.AllocatableMemoryMB, "allocatable_disk_gb": snapshot.AllocatableDiskGB}
+	var out struct {
+		ID           string `json:"id"`
+		RuntimeToken string `json:"runtime_token"`
+	}
+	header, value := "X-Bootstrap-Token", a.BootstrapToken
+	if a.HostID != "" {
+		header, value = "Authorization", "Bearer "+a.RuntimeToken
+	}
+	if err := a.request(ctx, "POST", "/api/v1/agents/register", body, &out, header, value); err != nil {
 		return err
 	}
-	a.HostID = fmt.Sprint(out["id"])
+	if out.ID == "" || (a.HostID != "" && out.ID != a.HostID) {
+		return errors.New("控制面返回的宿主机身份无效或发生改变")
+	}
+	if out.RuntimeToken != "" {
+		a.RuntimeToken = out.RuntimeToken
+	}
+	if len(a.RuntimeToken) < 32 {
+		return errors.New("控制面未返回有效的宿主机专属凭据")
+	}
+	a.HostID = out.ID
+	if a.State != nil {
+		return a.State.write("credentials.json", credentials{a.HostID, a.RuntimeToken})
+	}
 	return nil
 }
 
 func (a *Agent) heartbeat(ctx context.Context) error {
-	return a.request(ctx, "POST", "/api/v1/agents/"+a.HostID+"/heartbeat", a.Snapshot, nil, "Authorization", "Bearer "+a.RuntimeToken)
-}
-
-func (a *Agent) poll(ctx context.Context) error {
-	var task agentmodel.Task
-	err := a.request(ctx, "GET", "/api/v1/agents/"+a.HostID+"/tasks/next", nil, &task, "Authorization", "Bearer "+a.RuntimeToken)
-	if errors.Is(err, errNoContent) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	slog.Info("executing task", "task_id", task.ID, "type", task.Type, "driver", a.Driver.Mode())
-	result, executeErr := a.Driver.Execute(ctx, task)
-	if executeErr != nil {
-		result = taskFailureResult(executeErr)
-	}
-	return a.request(ctx, "POST", "/api/v1/agents/"+a.HostID+"/tasks/"+task.ID+"/result", result, nil, "Authorization", "Bearer "+a.RuntimeToken)
+	return a.request(ctx, "POST", "/api/v1/agents/"+a.HostID+"/heartbeat", a.snapshot(), nil, "Authorization", "Bearer "+a.RuntimeToken)
 }
 
 func taskFailureResult(executeErr error) agentmodel.TaskResult {
@@ -183,10 +180,17 @@ func taskFailureResult(executeErr error) agentmodel.TaskResult {
 	if errors.Is(executeErr, kvm.ErrIPAddressInUse) {
 		result.ErrorCode = "IP_ADDRESS_IN_USE"
 	}
+	if errors.Is(executeErr, kvm.ErrRollbackPending) {
+		result.ErrorCode = "ROLLBACK_PENDING"
+	}
 	return result
 }
 
 var errNoContent = errors.New("no content")
+
+type responseError struct{ Status int }
+
+func (e *responseError) Error() string { return fmt.Sprintf("控制面请求返回 HTTP %d", e.Status) }
 
 func (a *Agent) request(ctx context.Context, method, path string, body, out any, header, value string) error {
 	var reader io.Reader
@@ -212,11 +216,11 @@ func (a *Agent) request(ctx context.Context, method, path string, body, out any,
 		return errNoContent
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("control plane returned %s: %s", resp.Status, string(data))
+		// 外部响应正文可能含令牌、任务凭据或票据，不写入宿主日志。
+		return &responseError{Status: resp.StatusCode}
 	}
 	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
+		return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
 	}
 	return nil
 }

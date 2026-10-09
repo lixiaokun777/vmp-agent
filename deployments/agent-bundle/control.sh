@@ -18,6 +18,8 @@ load_config() {
   fi
   set -a
   . "$agent_config"
+  # 持久化凭据和任务结果随发布目录保存，升级时禁止删除该目录。
+  AGENT_STATE_DIR="${AGENT_STATE_DIR:-$agent_home/run/state}"
   set +a
 }
 

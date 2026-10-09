@@ -18,6 +18,9 @@ import (
 // ErrIPAddressInUse 表示候选 IP 在创建虚拟机前已能响应 ICMP 探测。
 var ErrIPAddressInUse = errors.New("IP address is already in use")
 
+// ErrRollbackPending 表示回滚尚未确认完成，磁盘和清单必须保留供后续安全补偿。
+var ErrRollbackPending = errors.New("创建回滚尚未完成，已保留磁盘和实例清单")
+
 // FileSystem 将受控目录操作与交付流程隔离，便于在临时目录中完整测试。
 type FileSystem interface {
 	Mkdir(string, fs.FileMode) error
@@ -125,6 +128,9 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 	if err != nil {
 		return result, err
 	}
+	if err := d.resumeCreateRollback(ctx, spec, plan); err != nil {
+		return result, err
+	}
 
 	existing, err := d.findDomain(ctx, spec.Name)
 	if err != nil {
@@ -170,31 +176,24 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 	if err := d.files.Mkdir(plan.InstanceDir, 0o700); err != nil {
 		return result, err
 	}
-	if err := d.prepareRuntimePath(plan.InstanceDir, 0o750); err != nil {
-		return result, err
-	}
-
-	domainDefined := false
 	defer func() {
 		if err == nil {
 			return
 		}
-		var rollbackErrors []error
-		if domainDefined {
-			rollbackCtx, cancelRollback := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancelRollback()
-			_, _ = d.virshWrite(rollbackCtx, "destroy", spec.Name)
-			if _, rollbackErr := d.virshWrite(rollbackCtx, "undefine", spec.Name); rollbackErr != nil {
-				rollbackErrors = append(rollbackErrors, fmt.Errorf("rollback undefine: %w", rollbackErr))
-			}
+		// SIGTERM、工作超时及租约丢失都不能切换后台上下文继续破坏性补偿。
+		if ctx.Err() != nil {
+			err = errors.Join(err, ErrRollbackPending, d.markCreateRollback(spec, plan))
+			return
 		}
-		if rollbackErr := d.removeFreshInstanceDirectory(spec.InstanceID, plan.InstanceDir); rollbackErr != nil {
-			rollbackErrors = append(rollbackErrors, fmt.Errorf("rollback directory: %w", rollbackErr))
-		}
-		if len(rollbackErrors) > 0 {
-			err = errors.Join(append([]error{err}, rollbackErrors...)...)
+		rollbackCtx, cancelRollback := context.WithTimeout(ctx, 15*time.Second)
+		defer cancelRollback()
+		if rollbackErr := d.rollbackCreate(rollbackCtx, spec, plan); rollbackErr != nil {
+			err = errors.Join(err, ErrRollbackPending, rollbackErr)
 		}
 	}()
+	if err := d.prepareRuntimePath(plan.InstanceDir, 0o750); err != nil {
+		return result, err
+	}
 
 	manifestData, err := json.MarshalIndent(instanceManifest{Version: 1, InstanceID: spec.InstanceID, Name: spec.Name}, "", "  ")
 	if err != nil {
@@ -235,7 +234,6 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 	if _, err := d.virshWrite(ctx, "define", plan.DomainXMLPath); err != nil {
 		return result, err
 	}
-	domainDefined = true
 	if _, err := d.virshWrite(ctx, "start", spec.Name); err != nil {
 		return result, err
 	}
@@ -243,6 +241,88 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 		return result, err
 	}
 	return agentmodel.TaskResult{Success: true, ProviderRef: spec.InstanceID, IPAddress: spec.IPAddress}, nil
+}
+
+// rollbackCreate 先记录补偿标记，再确认托管域已消失；任何不确定情况都禁止删盘。
+func (d *Driver) rollbackCreate(ctx context.Context, spec CreateSpec, plan ProvisionPlan) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := d.markCreateRollback(spec, plan); err != nil {
+		return err
+	}
+	domain, err := d.findDomain(ctx, spec.Name)
+	if err != nil {
+		return fmt.Errorf("确认回滚目标失败：%w", err)
+	}
+	if domain != nil {
+		if err := verifyManagedDomain(*domain, spec.InstanceID, spec.Name); err != nil {
+			return err
+		}
+		state, err := d.virsh(ctx, "domstate", spec.Name)
+		if err != nil {
+			return err
+		}
+		if normalized := normalizeState(string(state)); normalized != "SHUT_OFF" && normalized != "SHUTOFF" {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if _, err := d.virshWrite(ctx, "destroy", spec.Name); err != nil {
+				return fmt.Errorf("回滚停止域失败，禁止删除磁盘：%w", err)
+			}
+			if err := d.waitForDomainState(ctx, spec.Name, 5*time.Second, "SHUT_OFF", "SHUTOFF"); err != nil {
+				return err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := d.virshWrite(ctx, "undefine", spec.Name); err != nil {
+			return fmt.Errorf("回滚取消域定义失败，禁止删除磁盘：%w", err)
+		}
+	}
+	remaining, err := d.findDomain(ctx, spec.Name)
+	if err != nil || remaining != nil {
+		return errors.New("不能确认域已经移除，禁止删除磁盘")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return d.removeFreshInstanceDirectory(spec.InstanceID, plan.InstanceDir)
+}
+
+func (d *Driver) markCreateRollback(spec CreateSpec, plan ProvisionPlan) error {
+	data, err := json.Marshal(instanceManifest{Version: 1, InstanceID: spec.InstanceID, Name: spec.Name})
+	if err != nil {
+		return err
+	}
+	if err := d.files.WriteFile(filepath.Join(plan.InstanceDir, "rollback-pending.json"), data, 0o600); err != nil {
+		return fmt.Errorf("记录创建补偿标记失败：%w", err)
+	}
+	return nil
+}
+
+func (d *Driver) resumeCreateRollback(ctx context.Context, spec CreateSpec, plan ProvisionPlan) error {
+	marker := filepath.Join(plan.InstanceDir, "rollback-pending.json")
+	info, err := d.files.Lstat(marker)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w：补偿标记不是可信文件", ErrRollbackPending)
+	}
+	if _, err := d.validateFreshDirectory(spec.InstanceID, plan.InstanceDir); err != nil {
+		return err
+	}
+	data, err := d.files.ReadFile(marker)
+	var manifest instanceManifest
+	if err != nil || json.Unmarshal(data, &manifest) != nil || manifest.Version != 1 || manifest.InstanceID != spec.InstanceID || manifest.Name != spec.Name {
+		return fmt.Errorf("%w：补偿标记与任务不一致", ErrRollbackPending)
+	}
+	if err := d.rollbackCreate(ctx, spec, plan); err != nil {
+		return errors.Join(ErrRollbackPending, err)
+	}
+	return nil
 }
 
 func (d *Driver) ensureIPAddressAvailable(ctx context.Context, address string) error {
@@ -560,22 +640,30 @@ func (d *Driver) removeInstanceDirectory(instanceID, name, path string, allowMis
 }
 
 func (d *Driver) removeFreshInstanceDirectory(instanceID, path string) error {
+	exists, err := d.validateFreshDirectory(instanceID, path)
+	if err != nil || !exists {
+		return err
+	}
+	return d.files.RemoveAll(filepath.Clean(path))
+}
+
+func (d *Driver) validateFreshDirectory(instanceID, path string) (bool, error) {
 	root := filepath.Clean(d.config.StorageRoot)
 	cleanPath := filepath.Clean(path)
 	if filepath.Dir(cleanPath) != root || filepath.Base(cleanPath) != instanceID || !instanceIDPattern.MatchString(instanceID) {
-		return errors.New("refusing to remove an unsafe fresh instance directory")
+		return false, errors.New("refusing to remove an unsafe fresh instance directory")
 	}
 	info, err := d.files.Lstat(cleanPath)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("refusing to remove a fresh path that is not a directory")
+		return false, errors.New("refusing to remove a fresh path that is not a directory")
 	}
-	return d.files.RemoveAll(cleanPath)
+	return true, nil
 }
 
 func (d *Driver) validateInstanceDirectory(instanceID, name, path string, allowMissing bool) (bool, error) {
