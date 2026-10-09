@@ -7,8 +7,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -22,9 +22,13 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/creack/pty"
+	"vmp-agent/internal/agent/kvm"
 )
 
 var domainNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
+var instanceUUIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
+
+const consoleMetadataNamespace = "https://vmlease.local/xmlns/domain/1.0"
 
 type Config struct {
 	ListenAddress   string
@@ -36,10 +40,12 @@ type Config struct {
 	ControlPlaneURL string
 	RuntimeToken    string
 	HTTPClient      *http.Client
+	Runner          kvm.Runner
 }
 
 type Server struct {
-	config Config
+	config  Config
+	dialVNC func(context.Context, string) (net.Conn, error)
 }
 
 type ticket struct {
@@ -70,6 +76,9 @@ func New(config Config) (*Server, error) {
 	}
 	if config.HTTPClient == nil {
 		config.HTTPClient = &http.Client{Timeout: 5 * time.Second}
+	}
+	if config.Runner == nil {
+		config.Runner = kvm.CommandRunner{}
 	}
 	return &Server{config: config}, nil
 }
@@ -124,9 +133,14 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, mode string) 
 		http.Error(w, "控制台票据已过期或格式无效", http.StatusUnauthorized)
 		return result, false
 	}
-	if result.HostID != s.config.HostID || result.Mode != mode || !domainNamePattern.MatchString(result.Domain) {
+	if result.HostID != s.config.HostID || result.Mode != mode || !domainNamePattern.MatchString(result.Domain) || !instanceUUIDPattern.MatchString(result.Instance) {
 		http.Error(w, "控制台票据与当前宿主机不匹配", http.StatusForbidden)
 		return result, false
+	}
+	// 数据库库存可能尚未发现手工域替换；核销前以当前 UUID/元信息再次建立身份边界。
+	if err := s.verifyLiveDomain(r.Context(), result); err != nil {
+		http.Error(w, "托管域身份或状态已变化，拒绝连接，请刷新实例或联系管理员", http.StatusConflict)
+		return ticket{}, false
 	}
 	if err := s.consume(r.Context(), result); err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
@@ -185,17 +199,28 @@ func (s *Server) vnc(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	address, err := s.vncAddress(r.Context(), issued.Domain)
+	address, err := s.vncAddress(r.Context(), issued.Instance)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	upstream, err := net.DialTimeout("tcp", address, 5*time.Second)
+	dial := s.dialVNC
+	if dial == nil {
+		dial = func(ctx context.Context, address string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", address)
+		}
+	}
+	upstream, err := dial(r.Context(), address)
 	if err != nil {
 		http.Error(w, "无法连接 libvirt VNC："+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer upstream.Close()
+	// 端口在 domdisplay 后可能被外部 QEMU 复用；连接后复核且在此之前不转发任何字节。
+	if err := s.verifyVNCConnection(r.Context(), issued, address); err != nil {
+		http.Error(w, "托管域身份或状态已变化，拒绝连接，请重新连接", http.StatusConflict)
+		return
+	}
 	connection, err := s.accept(w, r)
 	if err != nil {
 		return
@@ -206,17 +231,18 @@ func (s *Server) vnc(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) vncAddress(ctx context.Context, domain string) (string, error) {
-	command := exec.CommandContext(ctx, s.config.VirshPath, "--readonly", "--connect", s.config.LibvirtURI, "domdisplay", domain, "--type", "vnc")
-	output, err := command.CombinedOutput()
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	output, err := s.config.Runner.Run(queryCtx, s.config.VirshPath, "--readonly", "--connect", s.config.LibvirtURI, "domdisplay", domain, "--type", "vnc")
 	if err != nil {
-		return "", fmt.Errorf("读取 VNC 地址失败：%s", strings.TrimSpace(string(output)))
+		return "", errors.New("读取托管域 VNC 地址失败")
 	}
 	displayURL, err := url.Parse(strings.TrimSpace(string(output)))
 	if err != nil || displayURL.Scheme != "vnc" {
 		return "", errors.New("libvirt 未返回有效的 VNC 地址")
 	}
 	hostname := displayURL.Hostname()
-	if hostname != "127.0.0.1" && hostname != "localhost" && hostname != "::1" {
+	if hostname != "127.0.0.1" && hostname != "::1" {
 		return "", errors.New("拒绝代理非本机 VNC 地址")
 	}
 	port, err := strconv.Atoi(displayURL.Port())
@@ -226,7 +252,22 @@ func (s *Server) vncAddress(ctx context.Context, domain string) (string, error) 
 	if port < 100 {
 		port += 5900
 	}
-	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), nil
+	if port < 1 || port > 65535 {
+		return "", errors.New("VNC 端口无效")
+	}
+	// 保持实际回环地址族；不能把 ::1 端点改拨到另一实例的 127.0.0.1 端口。
+	return net.JoinHostPort(hostname, strconv.Itoa(port)), nil
+}
+
+func (s *Server) verifyVNCConnection(ctx context.Context, issued ticket, address string) error {
+	if err := s.verifyLiveDomain(ctx, issued); err != nil {
+		return err
+	}
+	current, err := s.vncAddress(ctx, issued.Instance)
+	if err != nil || current != address {
+		return errors.New("托管域 VNC 端点已经改变，拒绝复用旧连接")
+	}
+	return nil
 }
 
 func (s *Server) serial(w http.ResponseWriter, r *http.Request) {
@@ -234,7 +275,7 @@ func (s *Server) serial(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	command := exec.CommandContext(r.Context(), s.config.VirshPath, "--connect", s.config.LibvirtURI, "console", "--force", issued.Domain)
+	command := s.serialCommand(r.Context(), issued)
 	terminal, err := pty.Start(command)
 	if err != nil {
 		http.Error(w, "无法打开串口控制台："+err.Error(), http.StatusBadGateway)
@@ -242,6 +283,10 @@ func (s *Server) serial(w http.ResponseWriter, r *http.Request) {
 	}
 	defer terminal.Close()
 	defer func() { _ = command.Process.Kill(); _ = command.Wait() }()
+	if err := s.verifyLiveDomain(r.Context(), issued); err != nil {
+		http.Error(w, "托管域身份或状态已变化，拒绝连接，请重新连接", http.StatusConflict)
+		return
+	}
 	connection, err := s.accept(w, r)
 	if err != nil {
 		return
@@ -249,6 +294,73 @@ func (s *Server) serial(w http.ResponseWriter, r *http.Request) {
 	defer connection.Close(websocket.StatusNormalClosure, "会话已结束")
 	slog.Info("串口控制台已连接", "domain", issued.Domain, "actor", issued.Actor, "session_id", issued.SessionID)
 	bridge(r.Context(), connection, terminal)
+}
+
+func (s *Server) serialCommand(ctx context.Context, issued ticket) *exec.Cmd {
+	return exec.CommandContext(ctx, s.config.VirshPath, "--connect", s.config.LibvirtURI, "console", "--force", issued.Instance)
+}
+
+func (s *Server) verifyLiveDomain(ctx context.Context, issued ticket) error {
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	data, err := s.config.Runner.Run(queryCtx, s.config.VirshPath, "--readonly", "--connect", s.config.LibvirtURI, "dumpxml", issued.Instance)
+	if err != nil || len(data) > 1<<20 {
+		return errors.New("托管域无法核验")
+	}
+	var domain struct {
+		XMLName  xml.Name `xml:"domain"`
+		UUID     string   `xml:"uuid"`
+		Name     string   `xml:"name"`
+		Metadata struct {
+			Instances []struct {
+				XMLName xml.Name
+				Fields  []struct {
+					XMLName xml.Name
+					Value   string `xml:",chardata"`
+				} `xml:",any"`
+			} `xml:"instance"`
+		} `xml:"metadata"`
+	}
+	if xml.Unmarshal(data, &domain) != nil || domain.UUID != issued.Instance || domain.Name != issued.Domain {
+		return errors.New("域标识不匹配")
+	}
+	matched := 0
+	for _, marker := range domain.Metadata.Instances {
+		if marker.XMLName.Space != consoleMetadataNamespace {
+			continue
+		}
+		managed, instance := "", ""
+		managedCount, instanceCount := 0, 0
+		for _, field := range marker.Fields {
+			if field.XMLName.Space != consoleMetadataNamespace {
+				continue
+			}
+			switch field.XMLName.Local {
+			case "managed-by":
+				managed = field.Value
+				managedCount++
+			case "instance-id":
+				instance = field.Value
+				instanceCount++
+			}
+		}
+		if managedCount != 1 || instanceCount != 1 || managed != "vmlease" || instance != issued.Instance {
+			return errors.New("域元信息不匹配")
+		}
+		matched++
+	}
+	if matched != 1 {
+		return errors.New("托管标记缺失或重复")
+	}
+	state, err := s.config.Runner.Run(queryCtx, s.config.VirshPath, "--readonly", "--connect", s.config.LibvirtURI, "domstate", issued.Instance)
+	if err != nil {
+		return errors.New("域运行状态无法核验")
+	}
+	switch strings.ToLower(strings.TrimSpace(string(state))) {
+	case "running", "paused", "blocked", "pmsuspended":
+		return nil
+	}
+	return errors.New("域不处于可控制状态")
 }
 
 func bridge(ctx context.Context, connection *websocket.Conn, upstream io.ReadWriter) {
