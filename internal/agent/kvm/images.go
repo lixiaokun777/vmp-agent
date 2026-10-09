@@ -155,6 +155,73 @@ func (d *Driver) writeImageIndex(index imageIndex) error {
 
 func imageKey(id string, generation int64) string { return fmt.Sprintf("%s:%d", id, generation) }
 
+func cacheContentDirectory(root *os.Root, digest string) (*os.File, error) {
+	if len(digest) != 64 || digest != strings.ToLower(digest) {
+		return nil, errors.New("缓存摘要无效")
+	}
+	if _, err := hex.DecodeString(digest); err != nil {
+		return nil, errors.New("缓存摘要无效")
+	}
+	directory, err := root.OpenFile(digest, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := directory.Stat()
+	if err != nil || !info.IsDir() || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 || info.Mode().Perm()&0o027 != 0 {
+		_ = directory.Close()
+		return nil, errors.New("缓存内容目录不安全：禁止组写入和其他用户权限")
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || stat.Uid != uint32(os.Geteuid()) {
+		_ = directory.Close()
+		return nil, errors.New("缓存内容目录必须属于 Agent 用户")
+	}
+	return directory, nil
+}
+
+func (d *Driver) sealCacheDirectory(root *os.Root, digest string) error {
+	directory, err := cacheContentDirectory(root, digest)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	// 启动脚本的 umask 077 会将 Mkdir(0750) 收紧为 0700；仅对已验证的自有目录显式封装权限。
+	// 使用描述符避免路径被替换后 chmod/chown 到符号链接目标，不开放组写入或其他用户权限。
+	if err := directory.Chown(-1, d.runtimeGID); err != nil {
+		return err
+	}
+	if err := directory.Chmod(0o750); err != nil {
+		return err
+	}
+	return directory.Sync()
+}
+
+func (d *Driver) validateCachedPermissions(root *os.Root, digest string, file *os.File) error {
+	directory, err := cacheContentDirectory(root, digest)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	info, err := directory.Stat()
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || info.Mode().Perm() != 0o750 || stat.Gid != uint32(d.runtimeGID) {
+		return errors.New("缓存内容目录权限不符合要求：须为 0750 且所属组为 KVM 运行组，请管理员检查")
+	}
+	info, err = file.Stat()
+	if err != nil {
+		return err
+	}
+	stat, ok = info.Sys().(*syscall.Stat_t)
+	// libvirt 动态 DAC 可将正在使用的 backing 文件转给 QEMU 用户，不能要求文件 UID 恒为 Agent。
+	// 边界仍为 Agent 自有且禁止组写的目录、0440/运行组和随后完整的索引与 SHA 核验；不修改在用文件属主。
+	if !ok || !info.Mode().IsRegular() || info.Mode().Perm() != 0o440 || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 || stat.Gid != uint32(d.runtimeGID) {
+		return errors.New("缓存镜像权限不符合要求：须为 0440 普通文件且所属组为 KVM 运行组")
+	}
+	return nil
+}
+
 func (d *Driver) cachedImage(ctx context.Context, id, checksum, fileName string, generation int64) (string, error) {
 	index, err := d.readImageIndex()
 	if err != nil {
@@ -172,11 +239,14 @@ func (d *Driver) cachedImage(ctx context.Context, id, checksum, fileName string,
 		return "", err
 	}
 	defer root.Close()
-	file, err := root.Open(filepath.Join(entry.Digest, entry.FileName))
+	file, err := root.OpenFile(filepath.Join(entry.Digest, entry.FileName), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
+	if err := d.validateCachedPermissions(root, entry.Digest, file); err != nil {
+		return "", err
+	}
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() != entry.Size {
 		return "", errors.New("镜像缓存损坏")
@@ -282,14 +352,15 @@ func (d *Driver) cacheImage(ctx context.Context, reader io.Reader, id, checksum,
 		return "", err
 	}
 	directory := filepath.Join(d.config.CacheRoot, digest)
-	if err := os.Mkdir(directory, 0o750); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := os.Mkdir(directory, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return "", err
 	}
-	info, err := os.Lstat(directory)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return "", errors.New("缓存内容目录不安全")
+	root, err := os.OpenRoot(d.config.CacheRoot)
+	if err != nil {
+		return "", err
 	}
-	if err := os.Chown(directory, -1, d.runtimeGID); err != nil {
+	defer root.Close()
+	if err := d.sealCacheDirectory(root, digest); err != nil {
 		return "", err
 	}
 	path := filepath.Join(directory, fileName)
@@ -300,14 +371,13 @@ func (d *Driver) cacheImage(ctx context.Context, reader io.Reader, id, checksum,
 		}
 	}()
 	if _, err := os.Lstat(path); err == nil {
-		root, openErr := os.OpenRoot(d.config.CacheRoot)
+		existing, openErr := root.OpenFile(filepath.Join(digest, fileName), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 		if openErr != nil {
 			return "", openErr
 		}
-		existing, openErr := root.Open(filepath.Join(digest, fileName))
-		_ = root.Close()
-		if openErr != nil {
-			return "", openErr
+		if err := d.validateCachedPermissions(root, digest, existing); err != nil {
+			_ = existing.Close()
+			return "", err
 		}
 		existingHash := sha256.New()
 		_, copyErr := io.Copy(existingHash, existing)
@@ -481,6 +551,9 @@ func (d *Driver) promoteCachedContent(ctx context.Context, payload syncImagePayl
 		return false, err
 	}
 	defer file.Close()
+	if err := d.validateCachedPermissions(root, strings.ToLower(payload.Checksum), file); err != nil {
+		return false, err
+	}
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > d.config.ImageMaxBytes {
 		return false, errors.New("既有缓存内容不安全")
