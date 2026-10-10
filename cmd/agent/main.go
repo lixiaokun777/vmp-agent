@@ -217,8 +217,13 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 
 func taskFailureResult(executeErr error) agentmodel.TaskResult {
 	result := agentmodel.TaskResult{Success: false, Error: executeErr.Error()}
+	result.IPProbeStatus, result.IPProbeMessage = kvm.IPProbeEvidence(executeErr)
 	if errors.Is(executeErr, kvm.ErrIPAddressInUse) {
 		result.ErrorCode = "IP_ADDRESS_IN_USE"
+	}
+	if errors.Is(executeErr, kvm.ErrIPProbeFailed) {
+		result.ErrorCode = "IP_PROBE_FAILED"
+		result.IPProbeStatus = ""
 	}
 	if errors.Is(executeErr, kvm.ErrRollbackPending) {
 		result.ErrorCode = "ROLLBACK_PENDING"

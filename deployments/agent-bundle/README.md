@@ -42,4 +42,6 @@ vmlease-agent/
 
 新版资源总预算和安全实时余量分离，上报镜像/网桥就绪。创建前增加 ARP DAD（安装 iputils-arping 并配置所需权限）；启动后分层检查 Guest Agent、cloud-init、SSH，未就绪保留 VM/磁盘/IP，使用同源控制台救援。控制台 19090 只允许控制节点，浏览器不直接访问宿主。
 
+地址探测校验 iputils 实现和真实应答，未知/Thomas/参数/权限/执行超时仅 IP_PROBE_FAILED，不隔离池。PROBE_IP_ADDRESS 复查不写域盘，FREE/IN_USE 都是完成探测；kvm-readonly 仍不领任务，新领取代际不复用旧空闲结论。关机/保留恢复检查原 IP，冲突保留原域/盘/IP且拒绝启动；运行幂等不自探测。
+
 远程/OSS 镜像必须 HTTPS，并配置 `KVM_IMAGE_ALLOWED_HOSTS`；私有 OSS 还需 `KVM_IMAGE_PRIVATE_HOSTS`。只读内容寻址缓存默认在 `KVM_IMAGE_ROOT/.vmp-cache`，不能手工删除在用 backing 或关闭 TLS 校验。详细限制见包内 `docs/镜像与交付安全.md`。

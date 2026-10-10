@@ -139,7 +139,7 @@ func (a *Agent) poll(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if stale, exists := cache.Entries[taskPayloadDigest(task)]; exists && stale.HostID == a.HostID && stale.Result.Success {
+	if stale, exists := cache.Entries[taskPayloadDigest(task)]; exists && task.Type != "PROBE_IP_ADDRESS" && stale.HostID == a.HostID && stale.Result.Success {
 		// 丢失确认但实际完成的任务只替换领取令牌，绝不重复执行副作用。
 		record.Result = stale.Result
 		return a.finishTask(ctx, record)
@@ -194,6 +194,8 @@ func (a *Agent) executeTask(ctx context.Context, record taskRecord) error {
 	result, executeErr := a.Driver.Execute(executeCtx, record.Task)
 	if executeErr != nil {
 		failure := taskFailureResult(executeErr)
+		failure.IPAddress = result.IPAddress
+		failure.ProviderRef = result.ProviderRef
 		failure.ImageID, failure.Checksum, failure.FileName, failure.ImageGeneration = result.ImageID, result.Checksum, result.FileName, result.ImageGeneration
 		result = failure
 		if record.Task.Type == "REBOOT_INSTANCE" {

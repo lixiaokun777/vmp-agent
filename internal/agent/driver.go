@@ -89,6 +89,8 @@ type Task struct {
 }
 
 type TaskResult struct {
+	IPProbeStatus   string `json:"ip_probe_status,omitempty"`
+	IPProbeMessage  string `json:"ip_probe_message,omitempty"`
 	ImageID         string `json:"image_id,omitempty"`
 	Checksum        string `json:"checksum,omitempty"`
 	FileName        string `json:"file_name,omitempty"`

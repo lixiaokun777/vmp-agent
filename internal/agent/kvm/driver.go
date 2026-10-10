@@ -58,14 +58,16 @@ type CommandRunner struct{}
 
 func (CommandRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	// 固定子进程输出语言，探测必须解析明确应答，不能根据本地化文本猜测占用。
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
 	output := &boundedCommandOutput{}
 	cmd.Stdout, cmd.Stderr = output, output
 	err := cmd.Run()
-	if err != nil {
-		return nil, fmt.Errorf("%s failed: %w: %s", filepath.Base(name), err, strings.TrimSpace(output.String()))
-	}
 	if output.truncated {
-		return nil, errors.New("工具输出超过安全上限")
+		return output.Bytes(), errors.New("工具输出超过安全上限")
+	}
+	if err != nil {
+		return output.Bytes(), fmt.Errorf("%s failed: %w: %s", filepath.Base(name), err, strings.TrimSpace(output.String()))
 	}
 	return output.Bytes(), nil
 }
@@ -188,6 +190,8 @@ func (d *Driver) Execute(ctx context.Context, task agentmodel.Task) (agentmodel.
 		return agentmodel.TaskResult{}, errors.New("KVM write operations are disabled; agent is in read-only mode")
 	}
 	switch task.Type {
+	case "PROBE_IP_ADDRESS":
+		return d.executeIPProbe(ctx, task)
 	case "CREATE_INSTANCE":
 		return d.executeCreate(ctx, task)
 	case "DELETE_INSTANCE":
@@ -312,6 +316,14 @@ func (d *Driver) preflight(ctx context.Context) []agentmodel.Check {
 	for name, path := range map[string]string{"virsh": d.config.VirshPath, "qemu-img": d.config.QemuImgPath, "seed-tool": d.config.SeedToolPath, "ping": d.config.PingPath, "arping": d.config.ArpingPath} {
 		info, err := os.Stat(path)
 		checks = append(checks, agentmodel.Check{Name: name, OK: err == nil && !info.IsDir(), Message: checkMessage(path, err)})
+	}
+	for _, tool := range []struct{ name, path string }{{"arping", d.config.ArpingPath}, {"ping", d.config.PingPath}} {
+		err := d.verifyIPUtils(ctx, tool.path, tool.name)
+		message := tool.name + " iputils 实现已核验；不代表 ARP 权限或实际网络已通过"
+		if err != nil {
+			message = err.Error()
+		}
+		checks = append(checks, agentmodel.Check{Name: tool.name + "-implementation", OK: err == nil, Message: message})
 	}
 	for name, root := range map[string]string{"storage-root": d.config.StorageRoot, "image-root": d.config.ImageRoot} {
 		checks = append(checks, pathCheck(name, root))

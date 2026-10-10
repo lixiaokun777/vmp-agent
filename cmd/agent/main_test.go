@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os/user"
 	"reflect"
@@ -61,6 +62,17 @@ func TestTaskFailureResultMarksOccupiedIPAddress(t *testing.T) {
 	result := taskFailureResult(fmt.Errorf("probe failed: %w", kvm.ErrIPAddressInUse))
 	if result.Success || result.ErrorCode != "IP_ADDRESS_IN_USE" {
 		t.Fatalf("unexpected task result: %#v", result)
+	}
+}
+
+func TestIPProbeFailureNeverReportsOccupied(t *testing.T) {
+	result := taskFailureResult(fmt.Errorf("工具校验失败：%w", kvm.ErrIPProbeFailed))
+	if result.Success || result.ErrorCode != "IP_PROBE_FAILED" || result.IPProbeStatus != "" {
+		t.Fatalf("探测错误被误报占用：%#v", result)
+	}
+	combined := taskFailureResult(errors.Join(kvm.ErrIPAddressInUse, kvm.ErrIPProbeFailed))
+	if combined.ErrorCode != "IP_PROBE_FAILED" || combined.IPProbeStatus != "" {
+		t.Fatal("未知故障不能保留占用标记")
 	}
 }
 

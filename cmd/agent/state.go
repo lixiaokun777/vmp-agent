@@ -56,7 +56,8 @@ func (s *stateStore) readResultCache() (resultCache, error) {
 }
 
 func (s *stateStore) retainResult(record taskRecord) error {
-	if !record.Result.Success {
+	// 地址观察不是不可逆副作用；失去领取代际后必须重新探测，不能复用陈旧空闲结论。
+	if !record.Result.Success || record.Task.Type == "PROBE_IP_ADDRESS" {
 		return nil
 	}
 	cache, err := s.readResultCache()

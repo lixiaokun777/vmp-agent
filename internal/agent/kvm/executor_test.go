@@ -27,6 +27,12 @@ func (r *executorRunner) Run(_ context.Context, name string, args ...string) ([]
 		return nil, errors.New("simulated command failure")
 	}
 	switch {
+	case command == "arping -V":
+		return []byte("arping from iputils 20240117\n"), nil
+	case command == "ping -V":
+		return []byte("ping from iputils 20240117\n"), nil
+	case strings.HasPrefix(command, "arping "):
+		return []byte("Sent 2 probes (2 broadcast(s))\nReceived 0 response(s)\n"), nil
 	case strings.Contains(command, "guest-file-open"):
 		return []byte(`{"return":1}`), nil
 	case strings.Contains(command, "guest-file-read"):
@@ -35,9 +41,9 @@ func (r *executorRunner) Run(_ context.Context, name string, args ...string) ([]
 		return []byte(`{"return":{}}`), nil
 	case strings.HasPrefix(command, "ping "):
 		if r.domainRunning {
-			return []byte("64 bytes from guest\n"), nil
+			return []byte("64 bytes from " + args[len(args)-1] + ": icmp_seq=1 ttl=64 time=0.1 ms\n1 packets transmitted, 1 received, 0% packet loss, time 0ms\n"), nil
 		}
-		return nil, noReplyError{}
+		return []byte("1 packets transmitted, 0 received, 100% packet loss, time 0ms\n"), noReplyError{}
 	case strings.Contains(command, "qemu-img info --output=json"):
 		return []byte(`{"format":"qcow2"}`), nil
 	case strings.Contains(command, "qemu-img create "):
@@ -362,7 +368,7 @@ func TestCreateRefusesOccupiedIPAddress(t *testing.T) {
 	runner.commands = nil
 	occupied := &occupiedIPRunner{executorRunner: runner}
 	driver.runner = occupied
-	if _, err := driver.Execute(context.Background(), createTask()); err == nil || !strings.Contains(err.Error(), "already in use") {
+	if _, err := driver.Execute(context.Background(), createTask()); !errors.Is(err, ErrIPAddressInUse) {
 		t.Fatalf("expected occupied IP to be rejected, got %v", err)
 	}
 }
@@ -372,8 +378,8 @@ type occupiedIPRunner struct {
 }
 
 func (r *occupiedIPRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
-	if filepath.Base(name) == "ping" {
-		return []byte("64 bytes from 10.200.9.21"), nil
+	if filepath.Base(name) == "ping" && !(len(args) == 1 && args[0] == "-V") {
+		return []byte("64 bytes from " + args[len(args)-1] + ": icmp_seq=1 ttl=64 time=0.1 ms\n1 packets transmitted, 1 received, 0% packet loss, time 0ms\n"), nil
 	}
 	return r.executorRunner.Run(ctx, name, args...)
 }

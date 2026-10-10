@@ -15,9 +15,6 @@ import (
 	agentmodel "vmp-agent/internal/agent"
 )
 
-// ErrIPAddressInUse 表示候选 IP 在创建虚拟机前已能响应 ICMP 探测。
-var ErrIPAddressInUse = errors.New("IP address is already in use")
-
 // ErrRollbackPending 表示回滚尚未确认完成，磁盘和清单必须保留供后续安全补偿。
 var ErrRollbackPending = errors.New("创建回滚尚未完成，已保留磁盘和实例清单")
 
@@ -112,6 +109,7 @@ type instanceManifest struct {
 	Name          string `json:"name"`
 	IPAddress     string `json:"ip_address,omitempty"`
 	MACAddress    string `json:"mac_address,omitempty"`
+	Bridge        string `json:"bridge,omitempty"`
 	BaseImagePath string `json:"base_image_path,omitempty"`
 }
 
@@ -135,6 +133,7 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 	if err != nil {
 		return result, err
 	}
+	result.IPAddress = spec.IPAddress
 	if err := d.resumeCreateRollback(ctx, spec, plan); err != nil {
 		return result, err
 	}
@@ -150,6 +149,8 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 		if _, err := d.validateInstanceDirectory(spec.InstanceID, spec.Name, plan.InstanceDir, false); err != nil {
 			return result, err
 		}
+		// 已存在域的重试不得让控制面把物理绑定误当成新候选 IP 自动更换。
+		result.ProviderRef = existing.ProviderUUID
 		stateOutput, err := d.virsh(ctx, "domstate", spec.Name)
 		if err != nil {
 			return result, err
@@ -157,7 +158,10 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 		switch normalizeState(string(stateOutput)) {
 		case "RUNNING":
 		case "SHUT_OFF", "SHUTOFF":
-			if _, err := d.virshWrite(ctx, "start", spec.Name); err != nil {
+			if err := d.checkStoppedDomainIP(ctx, existing, plan.InstanceDir, spec.IPAddress); err != nil {
+				return result, err
+			}
+			if _, err := d.virshWrite(ctx, "start", existing.ProviderUUID); err != nil {
 				return result, err
 			}
 		default:
@@ -206,7 +210,7 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 		return result, err
 	}
 
-	manifestData, err := json.MarshalIndent(instanceManifest{Version: 1, InstanceID: spec.InstanceID, Name: spec.Name, IPAddress: spec.IPAddress, MACAddress: spec.MACAddress, BaseImagePath: plan.BaseImagePath}, "", "  ")
+	manifestData, err := json.MarshalIndent(instanceManifest{Version: 1, InstanceID: spec.InstanceID, Name: spec.Name, IPAddress: spec.IPAddress, MACAddress: spec.MACAddress, Bridge: spec.Bridge, BaseImagePath: plan.BaseImagePath}, "", "  ")
 	if err != nil {
 		return result, err
 	}
@@ -333,26 +337,6 @@ func (d *Driver) resumeCreateRollback(ctx context.Context, spec CreateSpec, plan
 	return nil
 }
 
-func (d *Driver) ensureIPAddressAvailable(ctx context.Context, address, bridge string) error {
-	_, arpErr := d.runner.Run(ctx, d.config.ArpingPath, "-D", "-I", bridge, "-c", "2", "-w", "2", address)
-	if arpErr != nil {
-		var exitCoder interface{ ExitCode() int }
-		if errors.As(arpErr, &exitCoder) && exitCoder.ExitCode() == 1 {
-			return fmt.Errorf("%w：ARP 检测到地址冲突", ErrIPAddressInUse)
-		}
-		return errors.New("ARP 冲突探测失败，拒绝在未验证地址上创建虚机")
-	}
-	output, err := d.runner.Run(ctx, d.config.PingPath, "-c", "1", "-W", "1", address)
-	if err == nil {
-		return fmt.Errorf("%w: %s: %s", ErrIPAddressInUse, address, strings.TrimSpace(string(output)))
-	}
-	var exitCoder interface{ ExitCode() int }
-	if errors.As(err, &exitCoder) && exitCoder.ExitCode() == 1 {
-		return nil
-	}
-	return fmt.Errorf("IP occupancy probe failed: %w", err)
-}
-
 // waitForIPAddress 在交付成功前确认虚机已真正加载静态网络配置。
 func (d *Driver) waitForIPAddress(ctx context.Context, address string, timeout time.Duration) error {
 	deadline := time.NewTimer(timeout)
@@ -463,7 +447,10 @@ func (d *Driver) executePowerAction(ctx context.Context, task agentmodel.Task) (
 		if state != "SHUT_OFF" && state != "SHUTOFF" {
 			return agentmodel.TaskResult{}, fmt.Errorf("domain cannot be started from state %q", state)
 		}
-		if _, err := d.virshWrite(ctx, "start", payload.Name); err != nil {
+		if err := d.checkStoppedDomainIP(ctx, domain, instanceDir, ""); err != nil {
+			return agentmodel.TaskResult{}, err
+		}
+		if _, err := d.virshWrite(ctx, "start", domain.ProviderUUID); err != nil {
 			return agentmodel.TaskResult{}, err
 		}
 	case "STOP_INSTANCE":

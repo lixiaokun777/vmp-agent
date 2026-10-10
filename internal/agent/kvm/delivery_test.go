@@ -21,11 +21,11 @@ type deliveryTestRunner struct {
 
 func (r *deliveryTestRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	command := filepath.Base(name) + " " + strings.Join(args, " ")
-	if strings.HasPrefix(command, "arping ") {
+	if strings.HasPrefix(command, "arping ") && command != "arping -V" {
 		if r.arpConflict {
-			return nil, noReplyError{}
+			return []byte("Unicast reply from " + args[len(args)-1] + " [52:54:00:AA:BB:CC] 0.1ms\nSent 1 probes (1 broadcast(s))\nReceived 1 response(s)\n"), noReplyError{}
 		}
-		return []byte("ARP DAD no duplicate"), nil
+		return []byte("Sent 2 probes (2 broadcast(s))\nReceived 0 response(s)\n"), nil
 	}
 	if strings.Contains(command, "qemu-agent-command") {
 		if !r.guestReady {
