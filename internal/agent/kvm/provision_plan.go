@@ -231,6 +231,16 @@ type generatedDevices struct {
 	Graphics  generatedGraphics  `xml:"graphics"`
 	Serial    generatedSerial    `xml:"serial"`
 	Console   generatedConsole   `xml:"console"`
+	Balloon   generatedBalloon   `xml:"memballoon"`
+}
+
+type generatedBalloon struct {
+	Model string                `xml:"model,attr"`
+	Stats generatedBalloonStats `xml:"stats"`
+}
+
+type generatedBalloonStats struct {
+	Period int `xml:"period,attr"`
 }
 
 type generatedChannel struct {
@@ -335,6 +345,7 @@ func renderDomainXML(spec CreateSpec, diskPath, seedPath string) (string, error)
 			Graphics:  generatedGraphics{Type: "vnc", AutoPort: "yes", Listen: "127.0.0.1"},
 			Serial:    generatedSerial{Type: "pty", Target: generatedSerialTarget{Type: "isa-serial", Port: 0}},
 			Console:   generatedConsole{Type: "pty", Target: generatedConsoleTarget{Type: "serial", Port: 0}},
+			Balloon:   generatedBalloon{Model: "virtio", Stats: generatedBalloonStats{Period: 10}},
 		},
 	}
 	if spec.MACAddress != "" {

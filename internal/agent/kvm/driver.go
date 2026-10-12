@@ -97,6 +97,8 @@ type Driver struct {
 	catalog             agentmodel.Catalog
 	catalogLoaded       bool
 	cacheMu             sync.Mutex
+	metricsMu           sync.Mutex
+	cpuSamples          map[string]domainCPUSample
 	imageClientOverride *http.Client
 	sshProbe            func(context.Context, string) bool
 	// 仅供隔离测试注入网络实现，不从配置或任务接受此类回调。
@@ -175,7 +177,7 @@ func New(config Config, runner Runner) (*Driver, error) {
 			return nil, errors.New("KVM runtime group has an invalid gid")
 		}
 	}
-	return &Driver{config: config, runner: runner, files: OSFileSystem{}, runtimeGID: runtimeGID}, nil
+	return &Driver{config: config, runner: runner, files: OSFileSystem{}, runtimeGID: runtimeGID, cpuSamples: map[string]domainCPUSample{}}, nil
 }
 
 func (d *Driver) Mode() string {
@@ -234,6 +236,9 @@ func (d *Driver) Inspect(ctx context.Context) (agentmodel.Snapshot, error) {
 	if domainErr != nil {
 		checks = append(checks, agentmodel.Check{Name: "domain-discovery", OK: false, Message: domainErr.Error()})
 		status = "DEGRADED"
+	}
+	if domainErr == nil && !agentmodel.IsPreflight(ctx) {
+		d.collectDomainMetrics(ctx, domains, resourceMeasuredAt)
 	}
 	hostname, _ := os.Hostname()
 	totalDisk, diskErr := totalDiskGB(d.config.StorageRoot)
@@ -393,6 +398,81 @@ func (d *Driver) domains(ctx context.Context) ([]agentmodel.Domain, error) {
 		result = append(result, domain)
 	}
 	return result, nil
+}
+
+type domainCPUSample struct {
+	timeNS uint64
+	at     time.Time
+}
+
+// collectDomainMetrics 只采集平台托管且正在运行的域。指标失败不影响清单和调度心跳，
+// 避免一个虚拟机不支持 balloon 统计时把整台宿主机错误标记为不可用。
+func (d *Driver) collectDomainMetrics(ctx context.Context, domains []agentmodel.Domain, collectedAt time.Time) {
+	seen := make(map[string]struct{}, len(domains))
+	d.metricsMu.Lock()
+	defer d.metricsMu.Unlock()
+	for index := range domains {
+		domain := &domains[index]
+		if domain.Ownership != "MANAGED" || domain.State != "RUNNING" {
+			continue
+		}
+		seen[domain.ProviderUUID] = struct{}{}
+		output, err := d.virsh(ctx, "domstats", domain.ProviderUUID, "--cpu-total", "--balloon")
+		if err != nil {
+			continue
+		}
+		stats := parseDomainStats(output)
+		if cpuTime, ok := stats["cpu.time"]; ok {
+			if previous, exists := d.cpuSamples[domain.ProviderUUID]; exists && cpuTime >= previous.timeNS && collectedAt.After(previous.at) && domain.VCPUs > 0 {
+				elapsedNS := float64(collectedAt.Sub(previous.at).Nanoseconds())
+				value := 100 * float64(cpuTime-previous.timeNS) / elapsedNS / float64(domain.VCPUs)
+				if value < 0 {
+					value = 0
+				} else if value > 100 {
+					value = 100
+				}
+				domain.CPUUsagePercent = &value
+			}
+			d.cpuSamples[domain.ProviderUUID] = domainCPUSample{timeNS: cpuTime, at: collectedAt}
+		}
+		if current, currentOK := stats["balloon.current"]; currentOK {
+			if unused, unusedOK := stats["balloon.unused"]; unusedOK && current >= unused {
+				value := int((current - unused) / 1024)
+				domain.MemoryUsageMB = &value
+				domain.MemoryMetricSource = "guest_unused"
+			}
+		}
+		if domain.MemoryUsageMB == nil {
+			if rss, rssOK := stats["balloon.rss"]; rssOK {
+				value := int(rss / 1024)
+				domain.MemoryUsageMB = &value
+				domain.MemoryMetricSource = "host_rss"
+			}
+		}
+		if domain.CPUUsagePercent != nil || domain.MemoryUsageMB != nil {
+			domain.MetricsCollectedAt = collectedAt
+		}
+	}
+	for id := range d.cpuSamples {
+		if _, ok := seen[id]; !ok {
+			delete(d.cpuSamples, id)
+		}
+	}
+}
+
+func parseDomainStats(output []byte) map[string]uint64 {
+	result := map[string]uint64{}
+	for _, line := range strings.Split(string(output), "\n") {
+		key, raw, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		value, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+		if err == nil {
+			result[strings.TrimSpace(key)] = value
+		}
+	}
+	return result
 }
 
 type domainXML struct {

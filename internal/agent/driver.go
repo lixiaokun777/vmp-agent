@@ -64,6 +64,10 @@ type HostFacts struct {
 type Domain struct {
 	DeliveryStatus     string         `json:"delivery_status,omitempty"`
 	DeliveryMessage    string         `json:"delivery_message,omitempty"`
+	CPUUsagePercent    *float64       `json:"cpu_usage_percent,omitempty"`
+	MemoryUsageMB      *int           `json:"memory_usage_mb,omitempty"`
+	MemoryMetricSource string         `json:"memory_metric_source,omitempty"`
+	MetricsCollectedAt time.Time      `json:"metrics_collected_at,omitempty"`
 	ProviderUUID       string         `json:"provider_uuid"`
 	Name               string         `json:"name"`
 	State              string         `json:"state"`

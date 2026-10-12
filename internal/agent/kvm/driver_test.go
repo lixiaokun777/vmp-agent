@@ -6,7 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	agentmodel "vmp-agent/internal/agent"
 )
 
 const externalDomainXML = `<domain type="kvm"><name>legacy-db</name><uuid>11111111-2222-4333-8444-555555555555</uuid><memory unit="KiB">4194304</memory><vcpu>4</vcpu></domain>`
@@ -22,6 +26,50 @@ func TestParseExternalDomainDefaultsToReadOnlyOwnership(t *testing.T) {
 	}
 	if domain.MemoryMB != 4096 || domain.VCPUs != 4 {
 		t.Fatalf("unexpected resources: %#v", domain)
+	}
+}
+
+type metricRunner struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (runner *metricRunner) Run(_ context.Context, _ string, _ ...string) ([]byte, error) {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	runner.calls++
+	cpu := uint64(1_000_000_000)
+	if runner.calls > 1 {
+		cpu = 2_000_000_000
+	}
+	return []byte(fmt.Sprintf("Domain: 'vm'\n  cpu.time=%d\n  balloon.current=2097152\n  balloon.unused=524288\n", cpu)), nil
+}
+
+func TestCollectDomainMetricsCalculatesCPUAndMemory(t *testing.T) {
+	runner := &metricRunner{}
+	driver := &Driver{config: Config{VirshPath: "/usr/bin/virsh", LibvirtURI: "qemu:///system"}, runner: runner, cpuSamples: map[string]domainCPUSample{}}
+	domains := []agentmodel.Domain{{ProviderUUID: "123e4567-e89b-42d3-a456-426614174000", State: "RUNNING", Ownership: "MANAGED", VCPUs: 2}}
+	start := time.Unix(100, 0)
+	driver.collectDomainMetrics(context.Background(), domains, start)
+	if domains[0].CPUUsagePercent != nil || domains[0].MemoryUsageMB == nil || *domains[0].MemoryUsageMB != 1536 {
+		t.Fatalf("unexpected first sample: %#v", domains[0])
+	}
+	driver.collectDomainMetrics(context.Background(), domains, start.Add(time.Second))
+	if domains[0].CPUUsagePercent == nil || *domains[0].CPUUsagePercent != 50 {
+		t.Fatalf("unexpected CPU sample: %#v", domains[0].CPUUsagePercent)
+	}
+	if domains[0].MemoryMetricSource != "guest_unused" || domains[0].MetricsCollectedAt.IsZero() {
+		t.Fatalf("unexpected memory metadata: %#v", domains[0])
+	}
+}
+
+func TestParseDomainStatsIgnoresInvalidValues(t *testing.T) {
+	stats := parseDomainStats([]byte("cpu.time=123\nballoon.rss=oops\nwithout-separator\n"))
+	if stats["cpu.time"] != 123 {
+		t.Fatalf("unexpected stats: %#v", stats)
+	}
+	if _, ok := stats["balloon.rss"]; ok {
+		t.Fatalf("invalid value must be ignored: %#v", stats)
 	}
 }
 

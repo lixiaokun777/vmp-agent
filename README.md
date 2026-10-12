@@ -1,10 +1,12 @@
 # VMP Agent
 
-[0.5.4 发布](https://github.com/lixiaokun777/vmp-agent/releases/tag/v0.5.4) · [部署与运维](docs/部署与运维.md)
+[0.6.0 发布](https://github.com/lixiaokun777/vmp-agent/releases/tag/v0.6.0) · [部署与运维](docs/部署与运维.md)
 
 首次部署请从 [完整部署主手册](https://github.com/lixiaokun777/vmp-backend/blob/main/docs/部署指南.md) 开始，按顺序完成控制节点、数据库、Web 和宿主纳管；本仓库文档用于补充 Agent 的配置、权限和运维细节。
 
-当前推荐 Agent `0.5.4`、后端 `0.5.4`、前端 `0.5.3`。本版修复误装同名 `arping` 导致空闲地址被连续隔离的问题：验证 iputils 实现和真实应答证据，工具故障回报 `IP_PROBE_FAILED`，不冒充占用。保留 `0.5.3` 的缓存权限与动态 DAC 兼容，原身份、状态目录和磁盘无需重建。
+当前推荐 Agent、后端和前端均为 `0.6.0`。本版在保留 0.5.4 安全 IP 探测与原身份兼容的基础上，增加平台托管实例的只读 CPU / 内存指标采集。升级保留原 `agent.env`、身份文件、状态目录和实例磁盘，无需新增必填配置或重新签发凭据。
+
+0.6.0 增加平台托管实例的只读基础监控采集：CPU 来自相邻 `domstats cpu.time` 采样，内存优先使用 balloon guest 统计、缺失时回退 RSS。采集失败不影响宿主心跳和调度；正式使用曲线须配套支持 022 迁移的后端与前端 `0.6.0`。
 
 `0.5.2` 增加 `AGENT_MANAGEMENT_IP`，明确上报控制节点可达的宿主管理 IP，修复升级/重启后控制台管理地址丢失。正常独立身份升级到本版继续使用原凭据及完整状态目录，不要求重新签发。
 
