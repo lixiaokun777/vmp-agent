@@ -1,10 +1,10 @@
 # VMP Agent
 
-[0.6.0 发布](https://github.com/lixiaokun777/vmp-agent/releases/tag/v0.6.0) · [部署与运维](docs/部署与运维.md)
+[0.7.0 发布](https://github.com/lixiaokun777/vmp-agent/releases/tag/v0.7.0) · [部署与运维](docs/部署与运维.md)
 
 首次部署请从 [完整部署主手册](https://github.com/lixiaokun777/vmp-backend/blob/main/docs/部署指南.md) 开始，按顺序完成控制节点、数据库、Web 和宿主纳管；本仓库文档用于补充 Agent 的配置、权限和运维细节。
 
-本轮推荐配套 Agent、后端和前端均为 `0.7.0`（验收候选，尚未发布安装包）。候选修复损坏状态、配置静默回退、缓存引用膨胀、执行前磁盘复检和盘点并发；当前稳定发布仍为上方 0.6.0。升级保留原 `agent.env`、身份文件、状态目录和实例磁盘，无需新增必填配置或重新签发凭据；两个可选新配置为 `LOG_LEVEL=info` 和 `KVM_INVENTORY_CONCURRENCY=4`。
+本轮推荐配套 Agent、后端和前端均为 `0.7.0`，安装包由版本标签工作流发布。修复损坏状态、配置静默回退、缓存引用膨胀、执行前磁盘复检和盘点并发。升级保留原 `agent.env`、身份文件、状态目录和实例磁盘，无需新增必填配置或重新签发凭据；两个可选新配置为 `LOG_LEVEL=info` 和 `KVM_INVENTORY_CONCURRENCY=4`。完整步骤见 [0.7.0 发布与升级](https://github.com/lixiaokun777/vmp-backend/blob/codex/reliability-0.7.0/docs/0.7.0发布与升级.md)。
 
 0.6.0 增加平台托管实例的只读基础监控采集：CPU 来自相邻 `domstats cpu.time` 采样，内存优先使用 balloon guest 统计、缺失时回退 RSS。采集失败不影响宿主心跳和调度；正式使用曲线须配套支持 022 迁移的后端与前端 `0.6.0`。
 
