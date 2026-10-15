@@ -18,6 +18,8 @@ import (
 // ErrRollbackPending 表示回滚尚未确认完成，磁盘和清单必须保留供后续安全补偿。
 var ErrRollbackPending = errors.New("创建回滚尚未完成，已保留磁盘和实例清单")
 
+var ErrHostDiskInsufficient = errors.New("宿主机磁盘空间不足")
+
 // FileSystem 将受控目录操作与交付流程隔离，便于在临时目录中完整测试。
 type FileSystem interface {
 	Mkdir(string, fs.FileMode) error
@@ -177,12 +179,6 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 	if err != nil {
 		return result, err
 	}
-	d.cacheMu.Lock()
-	err = d.pinImage(plan.BaseImagePath)
-	d.cacheMu.Unlock()
-	if err != nil {
-		return result, err
-	}
 	if _, statErr := d.files.Lstat(plan.InstanceDir); statErr == nil {
 		return result, errors.New("instance directory already exists without a matching libvirt domain")
 	} else if !errors.Is(statErr, fs.ErrNotExist) {
@@ -206,6 +202,12 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 			err = errors.Join(err, ErrRollbackPending, rollbackErr)
 		}
 	}()
+	d.cacheMu.Lock()
+	err = d.pinImage(plan.BaseImagePath, spec.InstanceID)
+	d.cacheMu.Unlock()
+	if err != nil {
+		return result, err
+	}
 	if err := d.prepareRuntimePath(plan.InstanceDir, 0o750); err != nil {
 		return result, err
 	}
@@ -233,6 +235,17 @@ func (d *Driver) executeCreate(ctx context.Context, task agentmodel.Task) (resul
 	imageFormat, err := d.baseImageFormat(ctx, plan.BaseImagePath)
 	if err != nil {
 		return result, err
+	}
+	available := d.diskAvailable
+	if available == nil {
+		available = freeDiskGB
+	}
+	freeGB, diskErr := available(d.config.StorageRoot)
+	if diskErr != nil {
+		return result, fmt.Errorf("磁盘空间复检失败：%w", diskErr)
+	}
+	if freeGB <= spec.DiskGB+d.config.SafetyDiskGB {
+		return result, fmt.Errorf("%w：当前可用 %d GiB，需要大于 %d GiB（系统盘 %d + 安全保留 %d）", ErrHostDiskInsufficient, freeGB, spec.DiskGB+d.config.SafetyDiskGB, spec.DiskGB, d.config.SafetyDiskGB)
 	}
 	if _, err := d.runner.Run(ctx, d.config.QemuImgPath, "create", "-f", "qcow2", "-F", imageFormat, "-b", plan.BaseImagePath, plan.DiskPath, fmt.Sprintf("%dG", spec.DiskGB)); err != nil {
 		return result, err
@@ -300,7 +313,10 @@ func (d *Driver) rollbackCreate(ctx context.Context, spec CreateSpec, plan Provi
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return d.removeFreshInstanceDirectory(spec.InstanceID, plan.InstanceDir)
+	if err := d.removeFreshInstanceDirectory(spec.InstanceID, plan.InstanceDir); err != nil {
+		return err
+	}
+	return d.persistRemovalAndUnpin(spec.InstanceID)
 }
 
 func (d *Driver) markCreateRollback(spec CreateSpec, plan ProvisionPlan) error {
@@ -335,31 +351,6 @@ func (d *Driver) resumeCreateRollback(ctx context.Context, spec CreateSpec, plan
 		return errors.Join(ErrRollbackPending, err)
 	}
 	return nil
-}
-
-// waitForIPAddress 在交付成功前确认虚机已真正加载静态网络配置。
-func (d *Driver) waitForIPAddress(ctx context.Context, address string, timeout time.Duration) error {
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		output, err := d.runner.Run(ctx, d.config.PingPath, "-c", "1", "-W", "1", address)
-		if err == nil {
-			return nil
-		}
-		var exitCoder interface{ ExitCode() int }
-		if !errors.As(err, &exitCoder) || exitCoder.ExitCode() != 1 {
-			return fmt.Errorf("IP readiness probe failed: %w: %s", err, strings.TrimSpace(string(output)))
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline.C:
-			return fmt.Errorf("instance IP %s did not become reachable within %s", address, timeout)
-		case <-ticker.C:
-		}
-	}
 }
 
 func (d *Driver) prepareRuntimePath(path string, mode fs.FileMode) error {
@@ -406,7 +397,17 @@ func (d *Driver) executeDelete(ctx context.Context, task agentmodel.Task) (agent
 			return agentmodel.TaskResult{}, err
 		}
 	}
+	remaining, err := d.findDomain(ctx, payload.Name)
+	if err != nil || remaining != nil {
+		return agentmodel.TaskResult{}, errors.New("不能确认删除目标域已移除，保留磁盘和缓存引用")
+	}
+	if err := ctx.Err(); err != nil {
+		return agentmodel.TaskResult{}, err
+	}
 	if err := d.removeInstanceDirectory(payload.InstanceID, payload.Name, instanceDir, true); err != nil {
+		return agentmodel.TaskResult{}, err
+	}
+	if err := d.persistRemovalAndUnpin(payload.InstanceID); err != nil {
 		return agentmodel.TaskResult{}, err
 	}
 	return agentmodel.TaskResult{Success: true, ProviderRef: payload.InstanceID}, nil

@@ -18,7 +18,15 @@ type workerIntervals struct{ Heartbeat, Inventory, Poll time.Duration }
 func (a *Agent) snapshot() agentmodel.Snapshot {
 	a.snapshotMu.RLock()
 	defer a.snapshotMu.RUnlock()
-	return a.Snapshot
+	snapshot := a.Snapshot
+	if a.State != nil {
+		check := a.State.stateCheck()
+		snapshot.Checks = append(append([]agentmodel.Check(nil), snapshot.Checks...), check)
+		if !check.OK {
+			snapshot.Status = "DEGRADED"
+		}
+	}
+	return snapshot
 }
 
 func (a *Agent) loadCredentials() error {
@@ -55,26 +63,27 @@ func (a *Agent) run(ctx context.Context, intervals workerIntervals) {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			operation := func() {
+			backoff := retryBackoff{base: interval, limit: 30 * time.Second}
+			operation := func() time.Duration {
 				operationCtx, cancel := context.WithTimeout(ctx, timeout)
 				err := action(operationCtx)
 				cancel()
 				if err != nil && ctx.Err() == nil {
 					slog.Warn(name, "error", err)
 				}
+				if name == "任务执行或结果确认失败" {
+					return backoff.next(err != nil)
+				}
+				return interval
 			}
 			// 注册后立即启动独立检查，不等待一分钟才报告镜像/网桥矩阵。
-			if ctx.Err() == nil {
-				operation()
-			}
-			for {
+			for ctx.Err() == nil {
+				timer := time.NewTimer(operation())
 				select {
 				case <-ctx.Done():
+					timer.Stop()
 					return
-				case <-ticker.C:
-					operation()
+				case <-timer.C:
 				}
 			}
 		}()
@@ -151,6 +160,7 @@ func (a *Agent) poll(ctx context.Context) error {
 }
 
 func (a *Agent) executeTask(ctx context.Context, record taskRecord) error {
+	started := time.Now()
 	executeCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	renewDone := make(chan struct{})
@@ -210,7 +220,11 @@ func (a *Agent) executeTask(ctx context.Context, record taskRecord) error {
 	cancel(nil)
 	<-renewDone
 	record.Result = result
-	return a.finishTask(ctx, record)
+	err := a.finishTask(ctx, record)
+	if result.Success && err == nil {
+		slog.Info("托管任务完成", "task_id", record.Task.ID, "task_type", record.Task.Type, "instance_name", record.Task.Payload["name"], "duration", time.Since(started))
+	}
+	return err
 }
 
 func (a *Agent) finishTask(ctx context.Context, record taskRecord) error {

@@ -37,6 +37,14 @@ type Agent struct {
 }
 
 func main() {
+	if err := validateEnvironment(); err != nil {
+		slog.Error("Agent 配置无效", "error", err)
+		os.Exit(2)
+	}
+	if err := initLogging(); err != nil {
+		slog.Error("Agent 日志配置无效", "error", err)
+		os.Exit(2)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	managementIP, err := parseManagementIP(os.Getenv("AGENT_MANAGEMENT_IP"))
@@ -59,10 +67,18 @@ func main() {
 		os.Exit(2)
 	}
 	defer state.Close()
+	if err := state.validateTaskFiles(); err != nil {
+		slog.Error("Agent 任务状态检查失败", "error", err)
+		os.Exit(2)
+	}
 	a := &Agent{BaseURL: strings.TrimRight(env("CONTROL_PLANE_URL", "http://localhost:8080"), "/"), BootstrapToken: os.Getenv("AGENT_BOOTSTRAP_TOKEN"), RuntimeToken: os.Getenv("AGENT_RUNTIME_TOKEN"), HostID: os.Getenv("AGENT_HOST_ID"), Name: env("AGENT_NAME", "dev-kvm-simulator"), Client: &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}, Driver: driver, ConsolePublicURL: os.Getenv("CONSOLE_PUBLIC_URL"), State: state}
 	a.ManagementIP = managementIP
 	if err := a.loadCredentials(); err != nil {
 		slog.Error("无法读取宿主机凭据", "error", err)
+		os.Exit(2)
+	}
+	if err := a.validateRegistration(); err != nil {
+		slog.Error("Agent 注册配置无效", "error", err)
 		os.Exit(2)
 	}
 	inspectCtx, cancelInspect := context.WithTimeout(ctx, 90*time.Second)
@@ -72,17 +88,8 @@ func main() {
 		slog.Error("initial host inspection failed", "error", err)
 		os.Exit(2)
 	}
-	for {
-		err := a.register(ctx)
-		if err == nil {
-			break
-		}
-		slog.Warn("registration failed", "error", err)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(5 * time.Second):
-		}
+	if err := a.registerWithBackoff(ctx); err != nil {
+		return
 	}
 	slog.Info("agent registered", "host_id", a.HostID, "mode", a.Driver.Mode(), "domains", len(a.Snapshot.Domains), "status", a.Snapshot.Status)
 	if listenAddress := os.Getenv("CONSOLE_LISTEN_ADDR"); listenAddress != "" {
@@ -108,16 +115,19 @@ func main() {
 }
 
 func buildDriver() (agentmodel.Driver, error) {
+	if err := validateEnvironment(); err != nil {
+		return nil, err
+	}
 	mode := env("AGENT_MODE", "mock")
 	switch mode {
 	case "mock":
 		return &agentmodel.MockDriver{CPU: envInt("ALLOCATABLE_CPU", 24), MemoryMB: envInt("ALLOCATABLE_MEMORY_MB", 40960), DiskGB: envInt("ALLOCATABLE_DISK_GB", 500)}, nil
 	case "kvm-readonly", "kvm":
 		writeEnabled := mode == "kvm"
-		if writeEnabled && (env("KVM_WRITE_ENABLED", "false") != "true" || env("KVM_WRITE_CONFIRMATION", "") != "enable-kvm-write") {
+		if writeEnabled && (!envBool("KVM_WRITE_ENABLED", false) || env("KVM_WRITE_CONFIRMATION", "") != "enable-kvm-write") {
 			return nil, errors.New("KVM write mode requires KVM_WRITE_ENABLED=true and KVM_WRITE_CONFIRMATION=enable-kvm-write")
 		}
-		return kvm.New(kvm.Config{LibvirtURI: env("KVM_LIBVIRT_URI", "qemu:///system"), VirshPath: env("KVM_VIRSH_PATH", "/usr/bin/virsh"), QemuImgPath: env("KVM_QEMU_IMG_PATH", "/usr/bin/qemu-img"), SeedToolPath: env("KVM_SEED_TOOL_PATH", "/usr/bin/cloud-localds"), PingPath: env("KVM_PING_PATH", "/usr/bin/ping"), ArpingPath: env("KVM_ARPING_PATH", "/usr/bin/arping"), CacheRoot: os.Getenv("KVM_CACHE_ROOT"), ImageAllowedHosts: splitCSV(os.Getenv("KVM_IMAGE_ALLOWED_HOSTS")), ImagePrivateHosts: splitCSV(os.Getenv("KVM_IMAGE_PRIVATE_HOSTS")), ImageMaxBytes: int64(envInt("KVM_IMAGE_MAX_GB", 10)) << 30, CacheMaxBytes: int64(envInt("KVM_IMAGE_CACHE_MAX_GB", 40)) << 30, SafetyDiskGB: envInt("KVM_SAFETY_DISK_GB", 10), StorageRoot: env("KVM_STORAGE_ROOT", "/data/kvm-images/ephemeral"), ImageRoot: env("KVM_IMAGE_ROOT", "/data/cloud-init/images"), AllowedBridges: splitCSV(env("KVM_ALLOWED_BRIDGES", "br0")), CPUCap: envInt("ALLOCATABLE_CPU", 0), MemoryCapMB: envInt("ALLOCATABLE_MEMORY_MB", 40960), DiskCapGB: envInt("ALLOCATABLE_DISK_GB", 0), SafetyMemoryMB: envInt("KVM_SAFETY_MEMORY_MB", 10240), WriteEnabled: writeEnabled, RuntimeGroup: env("KVM_RUNTIME_GROUP", "kvm")}, nil)
+		return kvm.New(kvm.Config{LibvirtURI: env("KVM_LIBVIRT_URI", "qemu:///system"), VirshPath: env("KVM_VIRSH_PATH", "/usr/bin/virsh"), QemuImgPath: env("KVM_QEMU_IMG_PATH", "/usr/bin/qemu-img"), SeedToolPath: env("KVM_SEED_TOOL_PATH", "/usr/bin/cloud-localds"), PingPath: env("KVM_PING_PATH", "/usr/bin/ping"), ArpingPath: env("KVM_ARPING_PATH", "/usr/bin/arping"), CacheRoot: os.Getenv("KVM_CACHE_ROOT"), ImageAllowedHosts: splitCSV(os.Getenv("KVM_IMAGE_ALLOWED_HOSTS")), ImagePrivateHosts: splitCSV(os.Getenv("KVM_IMAGE_PRIVATE_HOSTS")), ImageMaxBytes: int64(envInt("KVM_IMAGE_MAX_GB", 10)) << 30, CacheMaxBytes: int64(envInt("KVM_IMAGE_CACHE_MAX_GB", 40)) << 30, InventoryConcurrency: envInt("KVM_INVENTORY_CONCURRENCY", 4), SafetyDiskGB: envInt("KVM_SAFETY_DISK_GB", 10), StorageRoot: env("KVM_STORAGE_ROOT", "/data/kvm-images/ephemeral"), ImageRoot: env("KVM_IMAGE_ROOT", "/data/cloud-init/images"), AllowedBridges: splitCSV(env("KVM_ALLOWED_BRIDGES", "br0")), CPUCap: envInt("ALLOCATABLE_CPU", 0), MemoryCapMB: envInt("ALLOCATABLE_MEMORY_MB", 40960), DiskCapGB: envInt("ALLOCATABLE_DISK_GB", 0), SafetyMemoryMB: envInt("KVM_SAFETY_MEMORY_MB", 10240), WriteEnabled: writeEnabled, RuntimeGroup: env("KVM_RUNTIME_GROUP", "kvm")}, nil)
 	default:
 		return nil, fmt.Errorf("unsupported AGENT_MODE %q; allowed values are mock, kvm-readonly and kvm", mode)
 	}
@@ -217,6 +227,9 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 
 func taskFailureResult(executeErr error) agentmodel.TaskResult {
 	result := agentmodel.TaskResult{Success: false, Error: executeErr.Error()}
+	if errors.Is(executeErr, kvm.ErrHostDiskInsufficient) {
+		result.ErrorCode = "HOST_DISK_INSUFFICIENT"
+	}
 	result.IPProbeStatus, result.IPProbeMessage = kvm.IPProbeEvidence(executeErr)
 	if errors.Is(executeErr, kvm.ErrIPAddressInUse) {
 		result.ErrorCode = "IP_ADDRESS_IN_USE"

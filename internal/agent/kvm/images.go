@@ -23,13 +23,16 @@ import (
 )
 
 type imageEntry struct {
-	ImageID    string `json:"image_id"`
-	Checksum   string `json:"checksum"`
-	FileName   string `json:"file_name"`
-	Generation int64  `json:"generation"`
-	Digest     string `json:"digest"`
-	Size       int64  `json:"size"`
-	Pinned     bool   `json:"pinned"`
+	ImageID           string   `json:"image_id"`
+	Checksum          string   `json:"checksum"`
+	FileName          string   `json:"file_name"`
+	Generation        int64    `json:"generation"`
+	Digest            string   `json:"digest"`
+	Size              int64    `json:"size"`
+	Pinned            bool     `json:"pinned"`
+	InstanceIDs       []string `json:"instance_ids,omitempty"`
+	ManualPin         bool     `json:"manual_pin,omitempty"`
+	ReferencesTracked bool     `json:"references_tracked,omitempty"`
 }
 type imageIndex struct {
 	Entries map[string]imageEntry `json:"entries"`
@@ -392,7 +395,7 @@ func (d *Driver) cacheImage(ctx context.Context, reader io.Reader, id, checksum,
 	} else {
 		created = true
 	}
-	index.Entries[imageKey(id, generation)] = imageEntry{ImageID: id, Checksum: strings.ToLower(checksum), FileName: fileName, Generation: generation, Digest: digest, Size: size}
+	index.Entries[imageKey(id, generation)] = preserveImagePins(imageEntry{ImageID: id, Checksum: strings.ToLower(checksum), FileName: fileName, Generation: generation, Digest: digest, Size: size}, index)
 	if err := d.writeImageIndex(index); err != nil {
 		return "", err
 	}
@@ -412,7 +415,7 @@ func syncImageDirectory(path string) error {
 	return directory.Sync()
 }
 
-func (d *Driver) pinImage(path string) error {
+func (d *Driver) pinImage(path string, instanceIDs ...string) error {
 	index, err := d.readImageIndex()
 	if err != nil {
 		return err
@@ -420,6 +423,16 @@ func (d *Driver) pinImage(path string) error {
 	digest := filepath.Base(filepath.Dir(path))
 	for key, entry := range index.Entries {
 		if entry.Digest == digest {
+			legacy := entry.Pinned && !entry.ReferencesTracked
+			entry.ReferencesTracked = !legacy || len(instanceIDs) == 0
+			if len(instanceIDs) == 0 {
+				entry.ManualPin = true
+			}
+			for _, id := range instanceIDs {
+				if !slices.Contains(entry.InstanceIDs, id) {
+					entry.InstanceIDs = append(entry.InstanceIDs, id)
+				}
+			}
 			entry.Pinned = true
 			index.Entries[key] = entry
 		}
@@ -573,11 +586,7 @@ func (d *Driver) promoteCachedContent(ctx context.Context, payload syncImagePayl
 		return false, err
 	}
 	entry := imageEntry{ImageID: payload.ImageID, FileName: payload.FileName, Checksum: strings.ToLower(payload.Checksum), Generation: payload.Generation, Digest: strings.ToLower(payload.Checksum), Size: info.Size()}
-	for _, old := range index.Entries {
-		if old.Digest == entry.Digest && old.FileName == entry.FileName && old.Pinned {
-			entry.Pinned = true
-		}
-	}
+	entry = preserveImagePins(entry, index)
 	index.Entries[imageKey(payload.ImageID, payload.Generation)] = entry
 	if err := d.writeImageIndex(index); err != nil {
 		return false, err

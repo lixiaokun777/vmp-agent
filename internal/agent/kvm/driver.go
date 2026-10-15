@@ -27,27 +27,28 @@ import (
 const metadataNamespace = "https://vmlease.local/xmlns/domain/1.0"
 
 type Config struct {
-	LibvirtURI        string
-	VirshPath         string
-	QemuImgPath       string
-	SeedToolPath      string
-	PingPath          string
-	ArpingPath        string
-	CacheRoot         string
-	ImageAllowedHosts []string
-	ImagePrivateHosts []string
-	ImageMaxBytes     int64
-	CacheMaxBytes     int64
-	SafetyDiskGB      int
-	StorageRoot       string
-	ImageRoot         string
-	AllowedBridges    []string
-	CPUCap            int
-	MemoryCapMB       int
-	DiskCapGB         int
-	SafetyMemoryMB    int
-	WriteEnabled      bool
-	RuntimeGroup      string
+	LibvirtURI           string
+	VirshPath            string
+	QemuImgPath          string
+	SeedToolPath         string
+	PingPath             string
+	ArpingPath           string
+	CacheRoot            string
+	ImageAllowedHosts    []string
+	ImagePrivateHosts    []string
+	ImageMaxBytes        int64
+	CacheMaxBytes        int64
+	SafetyDiskGB         int
+	InventoryConcurrency int
+	StorageRoot          string
+	ImageRoot            string
+	AllowedBridges       []string
+	CPUCap               int
+	MemoryCapMB          int
+	DiskCapGB            int
+	SafetyMemoryMB       int
+	WriteEnabled         bool
+	RuntimeGroup         string
 }
 
 type Runner interface {
@@ -101,6 +102,7 @@ type Driver struct {
 	cpuSamples          map[string]domainCPUSample
 	imageClientOverride *http.Client
 	sshProbe            func(context.Context, string) bool
+	diskAvailable       func(string) (int, error)
 	// 仅供隔离测试注入网络实现，不从配置或任务接受此类回调。
 	imageLookup  func(context.Context, string) ([]net.IPAddr, error)
 	imageDial    func(context.Context, string, string) (net.Conn, error)
@@ -108,6 +110,12 @@ type Driver struct {
 }
 
 func New(config Config, runner Runner) (*Driver, error) {
+	if config.InventoryConcurrency == 0 {
+		config.InventoryConcurrency = 4
+	}
+	if config.InventoryConcurrency < 1 || config.InventoryConcurrency > 32 {
+		return nil, errors.New("KVM_INVENTORY_CONCURRENCY 必须为 1 至 32")
+	}
 	if config.LibvirtURI == "" {
 		config.LibvirtURI = "qemu:///system"
 	}
@@ -255,14 +263,33 @@ func (d *Driver) Inspect(ctx context.Context) (agentmodel.Snapshot, error) {
 	var imagesComplete bool
 	facts.Images, imagesComplete = d.inspectImages(ctx)
 	facts.Networks = d.networkReadiness()
-	for index := range domains {
-		if !agentmodel.IsPreflight(ctx) && domains[index].Ownership == "MANAGED" && domains[index].State == "RUNNING" {
-			d.inspectDelivery(ctx, &domains[index])
+	if !agentmodel.IsPreflight(ctx) {
+		_ = d.parallelInventory(ctx, len(domains), func(index int) error {
+			if domains[index].Ownership == "MANAGED" && domains[index].State == "RUNNING" {
+				d.inspectDelivery(ctx, &domains[index])
+				if ctx.Err() != nil {
+					domains[index].DeliveryStatus = "UNKNOWN"
+					domains[index].DeliveryMessage = "本轮交付核验超出盘点预算，观察结果已陈旧"
+				}
+			}
+			return nil
+		})
+		if ctx.Err() != nil {
+			for i := range domains {
+				if domains[i].Ownership == "MANAGED" && domains[i].State == "RUNNING" && domains[i].DeliveryStatus == "" {
+					domains[i].DeliveryStatus = "UNKNOWN"
+					domains[i].DeliveryMessage = "本轮跳过交付核验，等待下轮盘点"
+				}
+			}
 		}
 	}
 	d.catalogMu.RLock()
 	facts.ReadinessComplete = d.catalogLoaded && ctx.Err() == nil && imagesComplete
 	d.catalogMu.RUnlock()
+	if ctx.Err() != nil {
+		status = "DEGRADED"
+		checks = append(checks, agentmodel.Check{Name: "inventory-budget", OK: false, Message: "本轮盘点预算已耗尽，未完成的交付核验标记为跳过/陈旧"})
+	}
 	return agentmodel.Snapshot{Status: status, AllocatableCPU: allocatableCPU, AllocatableMemoryMB: allocatableMemory, AllocatableDiskGB: allocatableDisk, Facts: facts, Domains: domains, InventoryComplete: domainErr == nil, Checks: checks}, nil
 }
 
@@ -379,15 +406,18 @@ func (d *Driver) domains(ctx context.Context) ([]agentmodel.Domain, error) {
 	if err != nil {
 		return nil, err
 	}
-	result := make([]agentmodel.Domain, 0)
-	for _, uuid := range strings.Fields(string(output)) {
+	uuids := strings.Fields(string(output))
+	result := make([]agentmodel.Domain, len(uuids))
+	valid := make([]bool, len(uuids))
+	err = d.parallelInventory(ctx, len(uuids), func(index int) error {
+		uuid := uuids[index]
 		xmlOutput, err := d.virsh(ctx, "dumpxml", uuid)
 		if err != nil {
-			return nil, fmt.Errorf("dump domain %s: %w", uuid, err)
+			return fmt.Errorf("dump domain %s: %w", uuid, err)
 		}
 		domain, err := parseDomainXML(xmlOutput)
 		if err != nil {
-			return nil, fmt.Errorf("parse domain %s: %w", uuid, err)
+			return fmt.Errorf("parse domain %s: %w", uuid, err)
 		}
 		stateOutput, stateErr := d.virsh(ctx, "domstate", uuid)
 		if stateErr != nil {
@@ -395,9 +425,17 @@ func (d *Driver) domains(ctx context.Context) ([]agentmodel.Domain, error) {
 		} else {
 			domain.State = normalizeState(string(stateOutput))
 		}
-		result = append(result, domain)
+		result[index] = domain
+		valid[index] = true
+		return ctx.Err()
+	})
+	compacted := make([]agentmodel.Domain, 0, len(result))
+	for i := range result {
+		if valid[i] {
+			compacted = append(compacted, result[i])
+		}
 	}
-	return result, nil
+	return compacted, err
 }
 
 type domainCPUSample struct {

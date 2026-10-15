@@ -88,9 +88,17 @@ func (d *Driver) collectUnusedCache(ctx context.Context, index imageIndex) (imag
 	if err != nil {
 		return index, err
 	}
+	index, err = d.migrateLegacyPins(index)
+	if err != nil {
+		return index, err
+	}
+	index = d.recoverDeletedPins(index, refs)
 	protected := map[string]bool{}
 	for key, entry := range index.Entries {
 		path := filepath.Join(d.config.CacheRoot, entry.Digest, entry.FileName)
+		if entry.Pinned || len(entry.InstanceIDs) > 0 {
+			protected[path] = true
+		}
 		if refs[path] {
 			protected[path] = true
 		}

@@ -123,6 +123,7 @@ func newWritableTestDriver(t *testing.T, runner *executorRunner) (*Driver, strin
 	if err != nil {
 		t.Fatal(err)
 	}
+	driver.diskAvailable = func(string) (int, error) { return 1024, nil }
 	return driver, storageRoot
 }
 

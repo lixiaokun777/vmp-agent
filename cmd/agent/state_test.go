@@ -57,8 +57,8 @@ func TestStateRejectsSymlinksAndCorruptFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "task.json"), []byte(`broken`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := state.read("task.json", &taskRecord{}); err == nil {
-		t.Fatal("损坏状态被忽略")
+	if err := state.read("task.json", &taskRecord{}); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("损坏任务没有隔离后返回空状态")
 	}
 	if err := state.read("missing.json", &saved); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("缺失文件错误无效：%v", err)

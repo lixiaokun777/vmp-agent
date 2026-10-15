@@ -59,6 +59,9 @@ func TestParseManagementIP(t *testing.T) {
 }
 
 func TestTaskFailureResultMarksOccupiedIPAddress(t *testing.T) {
+	if r := taskFailureResult(fmt.Errorf("空间复检：%w", kvm.ErrHostDiskInsufficient)); r.ErrorCode != "HOST_DISK_INSUFFICIENT" {
+		t.Fatal("缺少磁盘错误码")
+	}
 	result := taskFailureResult(fmt.Errorf("probe failed: %w", kvm.ErrIPAddressInUse))
 	if result.Success || result.ErrorCode != "IP_ADDRESS_IN_USE" {
 		t.Fatalf("unexpected task result: %#v", result)

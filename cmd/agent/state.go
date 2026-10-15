@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -43,8 +44,11 @@ const maxUnacknowledgedResults = 256
 
 func (s *stateStore) readResultCache() (resultCache, error) {
 	cache := resultCache{Entries: map[string]cachedSuccess{}}
-	if err := s.read("unacknowledged.json", &cache); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return cache, err
+	if err := s.read("unacknowledged.json", &cache); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return cache, err
+		}
+		cache.Entries = map[string]cachedSuccess{}
 	}
 	if cache.Entries == nil {
 		cache.Entries = map[string]cachedSuccess{}
@@ -147,6 +151,13 @@ func (s *stateStore) read(name string, value any) error {
 		return err
 	}
 	if err := json.Unmarshal(data, value); err != nil {
+		if name == "task.json" || name == "unacknowledged.json" {
+			if quarantineErr := s.quarantine(name); quarantineErr != nil {
+				return quarantineErr
+			}
+			slog.Error("Agent 状态文件损坏，原文件已隔离，请管理员核查未确认任务", "file", name)
+			return os.ErrNotExist
+		}
 		return fmt.Errorf("Agent 状态文件损坏，停止执行以保护资源：%w", err)
 	}
 	return nil
