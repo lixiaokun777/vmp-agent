@@ -1,10 +1,45 @@
 package kvm
 
 import (
+	"encoding/xml"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func assertHostPassthroughCPU(t *testing.T, domainXML string, cpu, memoryMB int) {
+	t.Helper()
+	var domain struct {
+		CPUs []struct {
+			Mode  string  `xml:"mode,attr"`
+			Model *string `xml:"model"`
+		} `xml:"cpu"`
+		VCPU   int `xml:"vcpu"`
+		Memory int `xml:"memory"`
+	}
+	if err := xml.Unmarshal([]byte(domainXML), &domain); err != nil {
+		t.Fatal(err)
+	}
+	if len(domain.CPUs) != 1 || domain.CPUs[0].Mode != "host-passthrough" || domain.CPUs[0].Model != nil {
+		t.Fatalf("域必须只有一个 host-passthrough CPU 配置且不指定兼容模型：%s", domainXML)
+	}
+	if domain.VCPU != cpu || domain.Memory != memoryMB {
+		t.Fatalf("CPU 模式不得改变申请的核数或内存：实际 %d 核/%d MiB，期望 %d 核/%d MiB", domain.VCPU, domain.Memory, cpu, memoryMB)
+	}
+}
+
+func TestBuildProvisionPlanUsesHostPassthroughCPU(t *testing.T) {
+	for _, cpu := range []int{1, 2, 4, 8} {
+		driver := &Driver{config: Config{StorageRoot: "/data/vmp", ImageRoot: "/data/images", AllowedBridges: []string{"br0"}}}
+		spec := validCreateSpec()
+		spec.CPU = cpu
+		plan, err := driver.BuildProvisionPlan(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertHostPassthroughCPU(t, plan.DomainXML, spec.CPU, spec.MemoryMB)
+	}
+}
 
 func validCreateSpec() CreateSpec {
 	return CreateSpec{

@@ -36,6 +36,7 @@ Agent 可选启用 VNC/串口 WebSocket 代理。VNC 始终由 libvirt 监听在
 
 ## 资源、镜像与交付
 
+- 源码未发布修复：新建 KVM 域使用 `host-passthrough`，透传宿主可虚拟化的 CPU 能力，核数仍按申请规格。此变更尚不包含在 0.7.0 安装包中；更新后不自动修改已有域。跨异构宿主热迁移需另行设计兼容模型，详见 [CPU 模式说明](docs/镜像与交付安全.md#cpu-模式与既有实例)。
 - `allocatable_*` 是固定总预算，和实际 `safe_available_*` 分开上报；`resource_measured_at` 标识真实读数时间，重复心跳不能把旧读数当成新容量。
 - 从控制面获取镜像/网络清单，逐宿主上报镜像版本、SHA-256 和网桥就绪；调度不能只看宿主总资源，还必须匹配已就绪镜像/网络。
 - `SYNC_IMAGE` 真实下载远程/OSS HTTPS 镜像，严格域名白名单，默认阻止私网、loopback、link-local、DNS 重绑定和重定向。私有 OSS 需要额外显式私网白名单，TLS 证书照常验证。

@@ -194,10 +194,15 @@ type generatedDomain struct {
 	UUID     string                   `xml:"uuid"`
 	Memory   generatedMemory          `xml:"memory"`
 	VCPU     int                      `xml:"vcpu"`
+	CPU      generatedCPU             `xml:"cpu"`
 	Metadata generatedMetadataWrapper `xml:"metadata"`
 	OS       generatedOS              `xml:"os"`
 	Features generatedFeatures        `xml:"features"`
 	Devices  generatedDevices         `xml:"devices"`
+}
+
+type generatedCPU struct {
+	Mode string `xml:"mode,attr"`
 }
 
 type generatedMemory struct {
@@ -328,6 +333,8 @@ func renderDomainXML(spec CreateSpec, diskPath, seedPath string) (string, error)
 		UUID:   spec.InstanceID,
 		Memory: generatedMemory{Unit: "MiB", Value: spec.MemoryMB},
 		VCPU:   spec.CPU,
+		// 临时研发机透传宿主可虚拟化的 CPU 能力，不使用默认的 qemu64 兼容模型。
+		CPU: generatedCPU{Mode: "host-passthrough"},
 		Metadata: generatedMetadataWrapper{
 			Instance: generatedMetadata{
 				ManagedBy:  "vmlease",

@@ -165,6 +165,12 @@ func TestExecuteCreateAndDeleteManagedInstance(t *testing.T) {
 	if !runner.domainPresent || !runner.domainRunning {
 		t.Fatal("domain was not defined and started")
 	}
+	assertHostPassthroughCPU(t, string(runner.domainXML), 2, 4096)
+	persistedXML, err := os.ReadFile(filepath.Join(instanceDir, "domain.xml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHostPassthroughCPU(t, string(persistedXML), 2, 4096)
 
 	deleteTask := agentmodel.Task{ID: "task-2", Type: "DELETE_INSTANCE", Payload: map[string]any{"instance_id": result.ProviderRef, "name": "lease-dev-001"}}
 	deleteResult, err := driver.Execute(context.Background(), deleteTask)
@@ -213,6 +219,44 @@ func TestCreateRetryIsIdempotent(t *testing.T) {
 	}
 	if createCount != 1 {
 		t.Fatalf("qemu image was created %d times", createCount)
+	}
+}
+
+func TestCreateRetryDoesNotChangeExistingCPUMode(t *testing.T) {
+	runner := &executorRunner{}
+	driver, storageRoot := newWritableTestDriver(t, runner)
+	first, err := driver.Execute(context.Background(), createTask())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟旧版创建的持久定义和运行域，重试不能补写 CPU 或重定义已有域。
+	legacyXML := strings.ReplaceAll(string(runner.domainXML), `<cpu mode="host-passthrough"></cpu>`, "")
+	if strings.Contains(legacyXML, "<cpu") {
+		t.Fatal("旧版域样例仍包含 CPU 模式")
+	}
+	runner.domainXML = []byte(legacyXML)
+	xmlPath := filepath.Join(storageRoot, first.ProviderRef, "domain.xml")
+	if err := os.WriteFile(xmlPath, []byte(legacyXML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner.commands = nil
+	result, err := driver.Execute(context.Background(), createTask())
+	if err != nil || !result.Success {
+		t.Fatalf("已有域重试失败：结果=%#v，错误=%v", result, err)
+	}
+	persistedXML, err := os.ReadFile(xmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(runner.domainXML) != legacyXML || string(persistedXML) != legacyXML {
+		t.Fatal("已有实例的运行域或持久定义被改写")
+	}
+	for _, command := range runner.commands {
+		for _, mutation := range []string{" define ", " destroy ", " shutdown ", " reboot ", " start ", "qemu-img create "} {
+			if strings.Contains(command, mutation) {
+				t.Fatalf("运行中旧实例重试不应修改或重启虚机：%s", command)
+			}
+		}
 	}
 }
 
