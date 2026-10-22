@@ -1,0 +1,47 @@
+#cloud-config
+# 仅用于临时增量盘验收，不向正式模板写入账号或凭据。
+users: []
+ssh_pwauth: false
+write_files:
+  - path: /usr/local/sbin/vmp-docker-smoke.sh
+    owner: root:root
+    permissions: '0700'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      trap 'echo VMP_IMAGE_TEST_RESULT=FAIL > /dev/ttyS0' ERR
+      systemctl start docker containerd qemu-guest-agent
+      systemctl is-active docker containerd qemu-guest-agent
+      docker version
+      docker compose version
+      docker-compose version
+      # 用本机 echo 和共享库构造最小测试镜像，不访问外部容器仓库。
+      test_root=$(mktemp -d /run/vmp-docker-rootfs.XXXXXX)
+      install -D /bin/echo "$test_root/bin/echo"
+      while IFS= read -r library; do
+        cp -L --parents "$library" "$test_root"
+      done < <(ldd /bin/echo | awk '/=> \// {print $3} /^[[:space:]]*\// {print $1}')
+      tar -C "$test_root" -cf - . | docker import - vmp-offline-smoke:local
+      docker run --rm --network none --read-only --cap-drop ALL \
+        --security-opt no-new-privileges vmp-offline-smoke:local /bin/echo VMP_DOCKER_OK
+      install -d -m 0700 /run/vmp-compose-smoke
+      printf '%s\n' \
+        'services:' \
+        '  smoke:' \
+        '    image: vmp-offline-smoke:local' \
+        '    pull_policy: never' \
+        '    network_mode: none' \
+        '    read_only: true' \
+        '    cap_drop: [ALL]' \
+        '    command: [/bin/echo, VMP_COMPOSE_OK]' > /run/vmp-compose-smoke/compose.yaml
+      docker compose -p vmp-smoke -f /run/vmp-compose-smoke/compose.yaml run --rm smoke
+      docker-compose -p vmp-smoke-legacy -f /run/vmp-compose-smoke/compose.yaml run --rm smoke
+      echo VMP_IMAGE_TEST_RESULT=PASS > /dev/ttyS0
+runcmd:
+  - [bash, /usr/local/sbin/vmp-docker-smoke.sh]
+power_state:
+  delay: now
+  mode: poweroff
+  timeout: 300
+  condition: true

@@ -1,5 +1,11 @@
 # 变更记录
 
+## 镜像制作工具 - 2026-10-22（Agent 安装包仍为 0.7.2）
+
+- 增加 Ubuntu 22.04 Docker/Compose V2 模板制作脚本，从只读原模板生成独立 8 GiB 副本，校验原镜像摘要不变，不覆盖原文件或在用 backing。
+- 使用 Ubuntu 官方签名仓库的软件包，启用 Docker/containerd，保留 Guest Agent，提供 `docker-compose` 兼容入口；不预设密码、仓库凭据、镜像加速器或免 sudo 的 Docker 组授权。
+- 增加独立增量盘 QEMU 启动验收，使用限制外联的用户态网络和本地导入测试镜像验证 Engine、Compose 及兼容入口，不占用公司 IP 或修改原虚机。
+
 ## 0.7.2 - 2026-10-22
 
 - 保留新建虚机 `host-passthrough` 修复，继续配套后端、前端 0.7.0；没有新增配置、协议或数据库变更。
