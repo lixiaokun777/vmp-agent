@@ -1,10 +1,10 @@
 # VMP Agent
 
-[0.7.1 发布](https://github.com/lixiaokun777/vmp-agent/releases/tag/v0.7.1) · [部署与运维](docs/部署与运维.md)
+[0.7.2 发布](https://github.com/lixiaokun777/vmp-agent/releases/tag/v0.7.2) · [部署与运维](docs/部署与运维.md)
 
 首次部署请从 [完整部署主手册](https://github.com/lixiaokun777/vmp-backend/blob/main/docs/部署指南.md) 开始，按顺序完成控制节点、数据库、Web 和宿主纳管；本仓库文档用于补充 Agent 的配置、权限和运维细节。
 
-本轮推荐 Agent `0.7.1`，继续配套后端、前端 `0.7.0`。本次仅发布 Agent，修复新建虚机 CPU 模式，无需更新前后端镜像或数据库。升级保留原 `agent.env`、身份文件、状态目录和实例磁盘，不新增必填配置、不重新签发凭据。完整升级流程见 [部署与运维](docs/部署与运维.md#11-升级与回滚)；0.7.0 基线与新增可选配置见 [0.7.0 发布与升级](https://github.com/lixiaokun777/vmp-backend/blob/v0.7.0/docs/0.7.0发布与升级.md)。
+本轮推荐 Agent `0.7.2`，继续配套后端、前端 `0.7.0`。本次仅发布 Agent，修复新建虚机 CPU 模式，无需更新前后端镜像或数据库。升级保留原 `agent.env`、身份文件、状态目录和实例磁盘，不新增必填配置、不重新签发凭据。完整升级流程见 [部署与运维](docs/部署与运维.md#11-升级与回滚)；0.7.0 基线与新增可选配置见 [0.7.0 发布与升级](https://github.com/lixiaokun777/vmp-backend/blob/v0.7.0/docs/0.7.0发布与升级.md)。
 
 0.6.0 增加平台托管实例的只读基础监控采集：CPU 来自相邻 `domstats cpu.time` 采样，内存优先使用 balloon guest 统计、缺失时回退 RSS。采集失败不影响宿主心跳和调度；正式使用曲线须配套支持 022 迁移的后端与前端 `0.6.0`。
 
@@ -36,7 +36,7 @@ Agent 可选启用 VNC/串口 WebSocket 代理。VNC 始终由 libvirt 监听在
 
 ## 资源、镜像与交付
 
-- Agent 0.7.1 起，新建 KVM 域使用 `host-passthrough`，透传宿主可虚拟化的 CPU 能力，核数仍按申请规格。0.7.0 安装包不包含此变更；升级后不自动修改已有域。跨异构宿主热迁移需另行设计兼容模型，详见 [CPU 模式说明](docs/镜像与交付安全.md#cpu-模式与既有实例)。
+- Agent 0.7.2 起，新建 KVM 域使用 `host-passthrough`，透传宿主可虚拟化的 CPU 能力，核数仍按申请规格。0.7.0 安装包不包含此变更；升级后不自动修改已有域。跨异构宿主热迁移需另行设计兼容模型，详见 [CPU 模式说明](docs/镜像与交付安全.md#cpu-模式与既有实例)。
 - `allocatable_*` 是固定总预算，和实际 `safe_available_*` 分开上报；`resource_measured_at` 标识真实读数时间，重复心跳不能把旧读数当成新容量。
 - 从控制面获取镜像/网络清单，逐宿主上报镜像版本、SHA-256 和网桥就绪；调度不能只看宿主总资源，还必须匹配已就绪镜像/网络。
 - `SYNC_IMAGE` 真实下载远程/OSS HTTPS 镜像，严格域名白名单，默认阻止私网、loopback、link-local、DNS 重绑定和重定向。私有 OSS 需要额外显式私网白名单，TLS 证书照常验证。
@@ -50,7 +50,7 @@ Agent 可选启用 VNC/串口 WebSocket 代理。VNC 始终由 libvirt 监听在
 
 ## 构建
 
-源码最低要求 Go 1.24（使用 `os.OpenRoot`），正式发布固定 Go 1.27.2，并运行 race、vet 和漏洞检查。
+源码最低要求 Go 1.24（使用 `os.OpenRoot`），正式发布固定 Go 1.27.3，并运行 race、vet 和漏洞检查。
 
 ```bash
 go test ./...
