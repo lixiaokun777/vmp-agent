@@ -2,7 +2,8 @@ package kvm
 
 import (
 	"encoding/json"
-	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -28,12 +29,15 @@ func (d *Driver) migrateLegacyPins(index imageIndex) (imageIndex, error) {
 		}
 		info, err := os.Lstat(filepath.Join(d.config.StorageRoot, dir.Name()))
 		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return index, errors.New("实例清单目录无法核验，保留旧缓存保护")
+			return index, fmt.Errorf("实例 %s 清单目录无法核验，保留旧缓存保护", dir.Name())
 		}
 		data, err := d.files.ReadFile(filepath.Join(d.config.StorageRoot, dir.Name(), "manifest.json"))
 		var m instanceManifest
-		if err != nil || json.Unmarshal(data, &m) != nil || m.InstanceID != dir.Name() || m.BaseImagePath == "" {
-			return index, errors.New("实例镜像引用无法核验，保留旧缓存保护")
+		if err != nil {
+			return index, fmt.Errorf("实例 %s 镜像引用无法核验，保留旧缓存保护：%w", dir.Name(), err)
+		}
+		if json.Unmarshal(data, &m) != nil || m.InstanceID != dir.Name() || m.BaseImagePath == "" {
+			return index, fmt.Errorf("实例 %s 镜像引用无法核验（清单无效、身份不符或缺少基础镜像路径），保留旧缓存保护", dir.Name())
 		}
 		refs[filepath.Clean(m.BaseImagePath)] = append(refs[filepath.Clean(m.BaseImagePath)], m.InstanceID)
 	}
@@ -81,7 +85,12 @@ func (d *Driver) persistRemovalAndUnpin(id string) error {
 	if err := syncImageDirectory(d.config.StorageRoot); err != nil {
 		return err
 	}
-	return d.unpinDeletedInstance(id)
+	// 域和实例目录均已删除并落盘；缓存整理失败只能延后回收，不能否认已完成的删除。
+	// 不清空损坏索引或绕过旧引用核验，后续缓存回收仍走完整安全检查。
+	if err := d.unpinDeletedInstance(id); err != nil {
+		slog.Warn("实例资源已删除，缓存引用整理延后，保留缓存保护", "event", "cache_unpin_deferred", "instance_id", id, "error", err)
+	}
+	return nil
 }
 
 // 完整域 backing 检查成功后，补全“已删盘但还没解引用就崩溃”的安全恢复。

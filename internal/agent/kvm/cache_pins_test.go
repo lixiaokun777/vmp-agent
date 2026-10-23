@@ -16,6 +16,119 @@ type failedRemovalFS struct{ FileSystem }
 
 func (f failedRemovalFS) RemoveAll(string) error { return errors.New("模拟磁盘删除尚未落盘") }
 
+func TestDeleteCompletesWhileUnverifiableLegacyCacheStaysProtected(t *testing.T) {
+	for _, manifest := range []string{"", "{", `{"instance_id":"123e4567-e89b-42d3-a456-426614174001"}`} {
+		t.Run("清单="+manifest, func(t *testing.T) {
+			r := &executorRunner{}
+			d, root := newWritableTestDriver(t, r)
+			d.runner = pinLifecycleRunner{r}
+			if _, err := d.Execute(context.Background(), createTask()); err != nil {
+				t.Fatal(err)
+			}
+			index, err := d.readImageIndex()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for key, e := range index.Entries {
+				e.Pinned, e.ReferencesTracked, e.InstanceIDs = true, false, nil
+				index.Entries[key] = e
+			}
+			if err := d.writeImageIndex(index); err != nil {
+				t.Fatal(err)
+			}
+			indexPath := filepath.Join(d.config.CacheRoot, "index.json")
+			before, err := os.ReadFile(indexPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 无关旧实例的清单异常不能阻塞当前实例删除，也不能放开缓存回收。
+			otherDir := filepath.Join(root, "123e4567-e89b-42d3-a456-426614174001")
+			if err := os.Mkdir(otherDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if manifest != "" {
+				if err := os.WriteFile(filepath.Join(otherDir, "manifest.json"), []byte(manifest), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			task := agentmodel.Task{Type: "DELETE_INSTANCE", Payload: map[string]any{"instance_id": createTask().Payload["instance_id"], "name": createTask().Payload["name"]}}
+			for attempt := 0; attempt < 2; attempt++ {
+				result, err := d.Execute(context.Background(), task)
+				if err != nil || !result.Success {
+					t.Fatalf("删除或幂等重试失败：%+v %v", result, err)
+				}
+			}
+			if r.domainPresent {
+				t.Fatal("域未删除却报告成功")
+			}
+			if _, err := os.Stat(filepath.Join(root, task.Payload["instance_id"].(string))); !os.IsNotExist(err) {
+				t.Fatal("目标实例目录未删除")
+			}
+			after, err := os.ReadFile(indexPath)
+			if err != nil || string(before) != string(after) {
+				t.Fatal("核验失败后旧缓存索引被改写")
+			}
+			for _, e := range index.Entries {
+				if _, err := os.Stat(filepath.Join(d.config.CacheRoot, e.Digest, e.FileName)); err != nil {
+					t.Fatal("保护中的基础镜像丢失", err)
+				}
+			}
+			if _, err := d.collectUnusedCache(context.Background(), index); err == nil {
+				t.Fatal("清单异常仍允许回收缓存")
+			}
+			if _, err := os.Stat(otherDir); err != nil {
+				t.Fatal("无关实例目录被删除", err)
+			}
+			// 补齐旧清单后，完整检查应能恢复回收，而不是永久泄漏已删除实例的缓存。
+			fixed, err := json.Marshal(instanceManifest{InstanceID: filepath.Base(otherDir), BaseImagePath: filepath.Join(d.config.ImageRoot, "legacy.qcow2")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(otherDir, "manifest.json"), fixed, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			recovered, err := d.collectUnusedCache(context.Background(), index)
+			if err != nil || len(recovered.Entries) != 0 {
+				t.Fatalf("补齐清单后未恢复安全回收：%+v %v", recovered, err)
+			}
+		})
+	}
+}
+
+func TestDeleteCompletesWithCorruptCacheIndex(t *testing.T) {
+	r := &executorRunner{}
+	d, _ := newWritableTestDriver(t, r)
+	d.runner = pinLifecycleRunner{r}
+	if _, err := d.Execute(context.Background(), createTask()); err != nil {
+		t.Fatal(err)
+	}
+	indexPath := filepath.Join(d.config.CacheRoot, "index.json")
+	if err := os.WriteFile(indexPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	task := agentmodel.Task{Type: "DELETE_INSTANCE", Payload: map[string]any{"instance_id": createTask().Payload["instance_id"], "name": createTask().Payload["name"]}}
+	result, err := d.Execute(context.Background(), task)
+	if err != nil || !result.Success {
+		t.Fatalf("缓存索引损坏不应否认已完成的删除：%+v %v", result, err)
+	}
+	data, err := os.ReadFile(indexPath)
+	if err != nil || string(data) != "{" {
+		t.Fatal("损坏索引不应被自动覆盖或清空")
+	}
+	if _, err := d.readImageIndex(); err == nil {
+		t.Fatal("损坏缓存索引仍可使用")
+	}
+}
+
+func TestRemovalSyncFailureStillFails(t *testing.T) {
+	d, root := newWritableTestDriver(t, &executorRunner{})
+	// 未确认父目录持久化时，绝不能把错误降为缓存维护告警。
+	d.config.StorageRoot = filepath.Join(root, "not-present")
+	if err := d.persistRemovalAndUnpin("123e4567-e89b-42d3-a456-426614174000"); err == nil {
+		t.Fatal("目录落盘失败仍报告成功")
+	}
+}
+
 func TestRemovalFailureKeepsPinsUntilRetryAfterRestart(t *testing.T) {
 	r := &executorRunner{}
 	d, _ := newWritableTestDriver(t, r)
